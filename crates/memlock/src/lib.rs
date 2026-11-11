@@ -736,16 +736,17 @@ mod tests {
             buf.try_as_mut_slice(),
             Err(MemLockError::BufferWiped)
         ));
-        assert!(matches!(buf.try_replace(b"x"), Err(MemLockError::BufferWiped)));
+        assert!(matches!(
+            buf.try_replace(b"x"),
+            Err(MemLockError::BufferWiped)
+        ));
     }
 
     #[test]
     fn partial_unlock_failure_quarantines_buffer_and_blocks_writes() {
         let _sim = SimGuard::set(test_hooks::SIM_UNLOCK_PARTIAL);
         let mut buf = LockedBuffer::try_allocate_for_len(16).expect("alloc");
-        buf.try_as_mut_slice()
-            .expect("mut")
-            .fill(0x5A);
+        buf.try_as_mut_slice().expect("mut").fill(0x5A);
 
         assert!(matches!(buf.wipe(), Err(MemLockError::UnlockFailed)));
         assert!(buf.is_quarantined());
@@ -754,14 +755,8 @@ mod tests {
             buf.try_as_mut_slice(),
             Err(MemLockError::BufferWiped)
         ));
-        assert!(matches!(
-            buf.try_set_len(1),
-            Err(MemLockError::BufferWiped)
-        ));
-        assert!(matches!(
-            buf.wipe(),
-            Err(MemLockError::UnlockFailed)
-        ));
+        assert!(matches!(buf.try_set_len(1), Err(MemLockError::BufferWiped)));
+        assert!(matches!(buf.wipe(), Err(MemLockError::UnlockFailed)));
     }
 
     #[test]
