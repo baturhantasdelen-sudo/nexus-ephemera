@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::c_void;
+
 use std::sync::OnceLock;
 use zeroize::Zeroize;
 
@@ -497,14 +497,14 @@ mod sys {
         #[cfg(test)]
         if test_hooks::sim() == test_hooks::SIM_LOCK_DIRTY_ROLLBACK {
             // SAFETY: test yolu — OS kilidi alındıktan sonra kirli rollback simülasyonu.
-            if unsafe { VirtualLock(ptr.cast::<c_void>(), len) } != 0 {
-                let _ = unsafe { VirtualUnlock(ptr.cast::<c_void>(), len) };
+            if unsafe { VirtualLock(ptr.cast::<std::ffi::c_void>(), len) } != 0 {
+                let _ = unsafe { VirtualUnlock(ptr.cast::<std::ffi::c_void>(), len) };
             }
             return Err(SysLockError::DirtyRollback);
         }
 
         // SAFETY: `ptr`/`len` bu tamponun sayfa hizalı, izole kilit aralığıdır.
-        if unsafe { VirtualLock(ptr.cast::<c_void>(), len) } != 0 {
+        if unsafe { VirtualLock(ptr.cast::<std::ffi::c_void>(), len) } != 0 {
             Ok(())
         } else {
             Err(SysLockError::Clean)
@@ -515,14 +515,14 @@ mod sys {
         #[cfg(test)]
         if test_hooks::sim() == test_hooks::SIM_UNLOCK_PARTIAL {
             // SAFETY: kısmi unlock hatası (advice yok); munlock/VirtualUnlock başarılı sayılır.
-            if unsafe { VirtualUnlock(ptr.cast::<c_void>(), len) } != 0 {
+            if unsafe { VirtualUnlock(ptr.cast::<std::ffi::c_void>(), len) } != 0 {
                 return Err(MemLockError::UnlockFailed);
             }
             return Err(MemLockError::UnlockFailed);
         }
 
         // SAFETY: aynı aralık daha önce `VirtualLock` ile kilitlendi.
-        if unsafe { VirtualUnlock(ptr.cast::<c_void>(), len) } != 0 {
+        if unsafe { VirtualUnlock(ptr.cast::<std::ffi::c_void>(), len) } != 0 {
             Ok(())
         } else {
             Err(MemLockError::UnlockFailed)
