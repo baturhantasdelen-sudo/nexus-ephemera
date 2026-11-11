@@ -2,12 +2,12 @@
 
 #![forbid(unsafe_code)]
 
+use mesh::EnvelopeBody;
 use nexus_ephemera::{
     WipeStatus,
     apoptosis::{EphemeralBuffer, is_engaged, trigger_apoptosis},
     crypto, mesh, scout,
 };
-use mesh::EnvelopeBody;
 use scout::{EncryptedScoutHandoff, ScoutReportMeta, ScoutSnapshot};
 
 #[tokio::test(flavor = "current_thread")]
