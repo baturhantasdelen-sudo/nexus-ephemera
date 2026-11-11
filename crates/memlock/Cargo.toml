@@ -1,0 +1,22 @@
+[package]
+name = "nexus-ephemera-memlock"
+version = "0.1.0"
+edition = "2024"
+description = "Safe page-lock wrappers (VirtualLock / mlock) for nexus-ephemera"
+publish = false
+license = "MIT"
+
+[dependencies]
+zeroize = { version = "1.7", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

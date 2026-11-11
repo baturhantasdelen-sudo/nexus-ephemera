@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [".", "crates/memlock"]
+
+[package]
+name = "nexus-ephemera"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-footprint offline scout bot with AEAD mesh and apoptosis memory wipe"
+publish = false
+
+[lib]
+name = "nexus_ephemera"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexus-ephemera"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+zeroize = "1.7"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+rand = "0.8"
+nexus-ephemera-memlock = { path = "crates/memlock" }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt", "macros"] }
+
+# Üretim ikilisi: LTO + strip; panik unwind (apoptosis catch_unwind).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+debug = false
+debug-assertions = false
+overflow-checks = true
+incremental = false
+panic = "unwind"
+
+[profile.test]
+overflow-checks = true
