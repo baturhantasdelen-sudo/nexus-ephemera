@@ -31,11 +31,25 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo test (debug, all targets)
-        run: cargo test --workspace --all-targets -- --nocapture
+      - name: Run cargo test (debug)
+        if: runner.os != 'Linux'
+        run: cargo test --workspace --all-targets
 
-      - name: cargo test (release)
-        run: cargo test --workspace --release -- --nocapture
+      - name: Run cargo test (debug)
+        if: runner.os == 'Linux'
+        run: |
+          sudo prlimit --pid=$$ --memlock=unlimited:unlimited
+          cargo test --workspace --all-targets
+
+      - name: Run cargo test (release)
+        if: runner.os != 'Linux'
+        run: cargo test --workspace --release
+
+      - name: Run cargo test (release)
+        if: runner.os == 'Linux'
+        run: |
+          sudo prlimit --pid=$$ --memlock=unlimited:unlimited
+          RUSTFLAGS="-D warnings" cargo test --workspace --release
 
       - name: cargo build (release)
         run: cargo build --workspace --release
