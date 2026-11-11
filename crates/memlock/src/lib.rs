@@ -2,7 +2,6 @@
 
 #![allow(unsafe_code)]
 
-
 use std::sync::OnceLock;
 use zeroize::Zeroize;
 
