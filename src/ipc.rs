@@ -414,7 +414,12 @@ fn listen<T>(
     let path = std::path::PathBuf::from(&config.listen);
     let mut listen_lock = match nexus_ephemera_ipc_os::ListenLock::acquire(&lock_path_for(&path)) {
         Ok(lock) => lock,
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+            || err.kind() == std::io::ErrorKind::ResourceBusy
+            || err.raw_os_error() == Some(11) // EAGAIN / EWOULDBLOCK
+            || err.raw_os_error() == Some(16) // EBUSY
+            =>
+        {
             return Err(IpcError::Protocol("listen socket is already in use"));
         }
         Err(err) => return Err(err.into()),
