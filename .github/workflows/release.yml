@@ -9,6 +9,11 @@ jobs:
   release:
     name: Release - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    
+    # Kiritik Düzeltme: GITHUB_TOKEN için yazma izni tanımlanıyor
+    permissions:
+      contents: write
+
     strategy:
       matrix:
         include:
@@ -21,7 +26,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
+      
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -44,11 +49,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum * > checksums.txt
-          else
-            shasum -a 256 * > checksums.txt
-          fi
+          sha256sum * > checksums.txt || shasum -a 256 * > checksums.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v1
