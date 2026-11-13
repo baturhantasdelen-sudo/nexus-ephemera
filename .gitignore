@@ -3,3 +3,11 @@
 /fuzz/target
 /fuzz/artifacts
 /fuzz/corpus
+
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+.venv/
+dist/

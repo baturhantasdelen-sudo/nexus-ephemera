@@ -49,6 +49,8 @@ pub struct AuthorizedCall<'a> {
     pub issued_at_unix_ms: u64,
     /// Opaque client token. It is not mixed into the binding digest.
     pub idempotency_key: &'a str,
+    /// `X-Nexus-Signature` header value. This is the HMAC, not the binding digest.
+    pub nexus_signature: &'a str,
 }
 
 static CALL_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -90,6 +92,7 @@ pub(crate) struct PendingDispatch {
     pub digest: String,
     pub nonce: u64,
     pub issued_at_unix_ms: u64,
+    pub signature: String,
     pub single_use: bool,
 }
 
@@ -102,6 +105,7 @@ impl PendingDispatch {
             call_nonce: self.nonce,
             issued_at_unix_ms: self.issued_at_unix_ms,
             idempotency_key: &self.command.idempotency_key,
+            nexus_signature: &self.signature,
         }
     }
 }
@@ -250,15 +254,16 @@ impl SecureTransactionAgent {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
-        let digest = match self.binding_digest(&command, nonce, issued_at_unix_ms) {
-            Ok(digest) => digest,
-            Err(err) => {
-                if apoptosis::is_shutting_down() {
-                    return Err(self.refuse_engaged(command, String::new()));
+        let (digest, signature) =
+            match self.binding_and_signature(&command, nonce, issued_at_unix_ms) {
+                Ok(signed) => signed,
+                Err(err) => {
+                    if apoptosis::is_shutting_down() {
+                        return Err(self.refuse_engaged(command, String::new()));
+                    }
+                    return Err(err);
                 }
-                return Err(err);
-            }
-        };
+            };
         if apoptosis::is_shutting_down() {
             return Err(self.refuse_engaged(command, digest));
         }
@@ -271,6 +276,7 @@ impl SecureTransactionAgent {
             digest,
             nonce,
             issued_at_unix_ms,
+            signature,
             single_use,
         })
     }
@@ -343,18 +349,27 @@ impl SecureTransactionAgent {
         }
     }
 
-    fn binding_digest(
+    fn binding_and_signature(
         &mut self,
         command: &ExecuteWithPolicy,
         nonce: u64,
         issued_at_unix_ms: u64,
-    ) -> Result<String, BrokerError> {
+    ) -> Result<(String, String), BrokerError> {
         let endpoint = command.target_endpoint.clone();
         let payload_hash = command.payload_hash.clone();
+        let idempotency_key = command.idempotency_key.clone();
         let grant = self.grant;
         self.ctx
             .with_buffer(&grant, |key| {
-                digest_hex(key, &endpoint, &payload_hash, nonce, issued_at_unix_ms)
+                let digest = digest_hex(key, &endpoint, &payload_hash, nonce, issued_at_unix_ms);
+                let signature = crate::crypto::sign_request_header(
+                    key,
+                    issued_at_unix_ms,
+                    &idempotency_key,
+                    &payload_hash,
+                    &endpoint,
+                );
+                (digest, signature)
             })
             .map_err(map_context)
     }
@@ -876,11 +891,12 @@ mod tests {
 
     fn http_request_bytes(call: &AuthorizedCall<'_>) -> Vec<u8> {
         format!(
-            "POST {} HTTP/1.1\r\nx-nonce: {}\r\nx-issued-at: {}\r\nx-binding: {}\r\n\r\n{}",
+            "POST {} HTTP/1.1\r\nx-nonce: {}\r\nx-issued-at: {}\r\nx-binding: {}\r\nX-Nexus-Signature: {}\r\n\r\n{}",
             call.target_endpoint,
             call.call_nonce,
             call.issued_at_unix_ms,
             call.binding_digest_hex,
+            call.nexus_signature,
             call.payload_hash
         )
         .into_bytes()

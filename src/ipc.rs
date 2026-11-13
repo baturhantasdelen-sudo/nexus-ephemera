@@ -177,8 +177,15 @@ pub struct DaemonConfig {
 
 impl DaemonConfig {
     pub fn checked(mut self) -> Result<Self, IpcError> {
-        if self.allowlist.is_empty() || self.allowlist.iter().any(|item| item.is_empty()) {
-            return Err(IpcError::Protocol("allowlist is empty"));
+        if self.allowlist.is_empty()
+            || self
+                .allowlist
+                .iter()
+                .any(|item| strict_service_target(item).is_err())
+        {
+            return Err(IpcError::Protocol(
+                "allowlist endpoint is not a strict https target",
+            ));
         }
         if self.max_payload_bytes == 0 || self.max_payload_bytes > HARD_PAYLOAD_CAP {
             return Err(IpcError::Protocol("payload limit is outside 1..=65536"));
@@ -206,6 +213,7 @@ impl SecureTransport for LocalAcceptTransport {
     ) -> Result<TransportReply, BrokerError> {
         if call.call_nonce == 0
             || call.binding_digest_hex.is_empty()
+            || call.nexus_signature.is_empty()
             || call.payload_hash.is_empty()
             || call.idempotency_key.is_empty()
         {
@@ -645,21 +653,19 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
             || request.payload_hash.len() > PAYLOAD_HASH_MAX
             || !crate::idempotency::valid_key(&request.idempotency_key)
         {
-            return Err(
-                if request.endpoint.len() > ENDPOINT_MAX
-                    || request.payload_hash.len() > PAYLOAD_HASH_MAX
-                {
-                    IpcError::PayloadTooLarge {
-                        limit: ENDPOINT_MAX,
-                    }
-                } else {
-                    IpcError::Malformed
-                },
-            );
+            return Err(if request.endpoint.len() > ENDPOINT_MAX {
+                IpcError::PayloadTooLarge {
+                    limit: ENDPOINT_MAX,
+                }
+            } else if request.payload_hash.len() > PAYLOAD_HASH_MAX {
+                IpcError::PayloadTooLarge {
+                    limit: PAYLOAD_HASH_MAX,
+                }
+            } else {
+                IpcError::Malformed
+            });
         }
-        if !self.allowlist.iter().any(|item| item == &request.endpoint) {
-            return Err(IpcError::TargetDenied);
-        }
+        resolve_allowlisted_endpoint(&self.allowlist, &request.endpoint)?;
         match self.idempotency.lookup(
             &request.idempotency_key,
             &request.endpoint,
@@ -680,9 +686,10 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
         request: &WireRequest,
     ) -> Result<TransactionReceipt, IpcError> {
         let started = std::time::Instant::now();
+        let endpoint = resolve_allowlisted_endpoint(&self.allowlist, &request.endpoint)?;
         let command = ExecuteWithPolicy {
             context_id: self.agent.context_id(),
-            target_endpoint: request.endpoint.clone(),
+            target_endpoint: endpoint.to_string(),
             payload_hash: request.payload_hash.clone(),
             idempotency_key: request.idempotency_key.clone(),
         };
@@ -706,6 +713,7 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
             call_nonce: pending.nonce,
             issued_at_unix_ms: pending.issued_at_unix_ms,
             idempotency_key: pending.command.idempotency_key.clone(),
+            nexus_signature: pending.signature.clone(),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
@@ -719,6 +727,7 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
                         call_nonce: call.call_nonce,
                         issued_at_unix_ms: call.issued_at_unix_ms,
                         idempotency_key: &call.idempotency_key,
+                        nexus_signature: &call.nexus_signature,
                     })
                 }));
                 let reply = match reply {
@@ -803,6 +812,36 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
     }
 }
 
+/// The outbound target is the allowlist entry, never a client-supplied variant.
+fn resolve_allowlisted_endpoint<'a>(
+    allowlist: &'a [String],
+    requested: &str,
+) -> Result<&'a str, IpcError> {
+    strict_service_target(requested)?;
+    allowlist
+        .iter()
+        .find(|item| item.as_str() == requested)
+        .map(String::as_str)
+        .ok_or(IpcError::TargetDenied)
+}
+
+fn strict_service_target(value: &str) -> Result<(), IpcError> {
+    let host_and_path = value
+        .strip_prefix("https://")
+        .filter(|rest| !rest.is_empty())
+        .ok_or(IpcError::TargetDenied)?;
+    let unsafe_byte = value.bytes().any(|byte| {
+        byte.is_ascii_whitespace() || byte < 0x20 || matches!(byte, b'@' | b'#' | b'\\')
+    });
+    let dotted = host_and_path
+        .split('/')
+        .any(|segment| segment == ".." || segment == ".");
+    if unsafe_byte || dotted || host_and_path.contains("//") {
+        return Err(IpcError::TargetDenied);
+    }
+    Ok(())
+}
+
 fn client_outcome_err(err: BrokerError) -> IpcError {
     match client_outcome(Err(err)) {
         Ok(_) => IpcError::Inconclusive,
@@ -817,6 +856,7 @@ struct OwnedProviderCall {
     call_nonce: u64,
     issued_at_unix_ms: u64,
     idempotency_key: String,
+    nexus_signature: String,
 }
 
 async fn write_response<S>(
@@ -870,15 +910,17 @@ impl NexusClient {
             || endpoint.len() > ENDPOINT_MAX
             || payload_hash.len() > PAYLOAD_HASH_MAX
         {
-            return Err(
-                if endpoint.len() > ENDPOINT_MAX || payload_hash.len() > PAYLOAD_HASH_MAX {
-                    IpcError::PayloadTooLarge {
-                        limit: ENDPOINT_MAX,
-                    }
-                } else {
-                    IpcError::Malformed
-                },
-            );
+            return Err(if endpoint.len() > ENDPOINT_MAX {
+                IpcError::PayloadTooLarge {
+                    limit: ENDPOINT_MAX,
+                }
+            } else if payload_hash.len() > PAYLOAD_HASH_MAX {
+                IpcError::PayloadTooLarge {
+                    limit: PAYLOAD_HASH_MAX,
+                }
+            } else {
+                IpcError::Malformed
+            });
         }
         let deadline = std::time::Instant::now() + self.timeout;
         let mut last = IpcError::TimedOut;
@@ -1311,6 +1353,31 @@ compile_error!("nexus-ephemera ipc requires unix or windows");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn off_allowlist_targets_are_denied_before_dispatch() {
+        let allow = vec!["https://provider.example/charge".to_string()];
+        assert_eq!(
+            resolve_allowlisted_endpoint(&allow, "https://provider.example/charge").unwrap(),
+            "https://provider.example/charge"
+        );
+        for rejected in [
+            "https://evil.example/charge",
+            "https://provider.example/charge/extra",
+            "https://user@provider.example/charge",
+            "https://provider.example/charge#fragment",
+            "https://provider.example/charge/../admin",
+            "http://provider.example/charge",
+        ] {
+            assert!(
+                matches!(
+                    resolve_allowlisted_endpoint(&allow, rejected),
+                    Err(IpcError::TargetDenied)
+                ),
+                "{rejected}"
+            );
+        }
+    }
 
     #[test]
     fn peer_policy_rejects_missing_and_foreign_callers() {

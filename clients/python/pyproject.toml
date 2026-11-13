@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nexus-ephemera-py"
+version = "0.2.0"
+description = "Thin asyncio client for the nexus-ephemera broker. It never fetches the raw key."
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Baturhan Taşdelen", email = "baturhantasdelen@gmail.com"}]
+keywords = ["nexus-ephemera", "ipc", "broker"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["mypy>=1.13", "pytest>=8"]
+
+[project.urls]
+Repository = "https://github.com/baturhantasdelen-sudo/nexus-ephemera"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nexus_ephemera"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/nexus_ephemera", "tests", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+packages = ["nexus_ephemera"]
+warn_unused_ignores = true
