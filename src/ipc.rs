@@ -1395,16 +1395,20 @@ mod tests {
     #[tokio::test]
     async fn live_socket_is_not_unlinked() {
         use std::os::unix::fs::PermissionsExt;
+        #[cfg(target_os = "macos")]
+        let dir =
+            std::path::PathBuf::from("/tmp").join(format!("nexus-run-{}", std::process::id()));
+        #[cfg(not(target_os = "macos"))]
         let dir = std::env::temp_dir().join(format!("nexus-ephemera-run-{}", std::process::id()));
+
         let _ = std::fs::create_dir(&dir);
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         let path = dir.join(format!(
-            "nexus-ephemera-live-{}-{}.sock",
-            std::process::id(),
+            "nexus-live-{}.sock",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_nanos()
+                .as_millis()
         ));
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, b"not-a-socket").expect("regular file");
@@ -1453,7 +1457,7 @@ mod tests {
             IpcError::Protocol("listen socket is already in use")
         ));
         let held = std::path::PathBuf::from(format!("{}.held", path.display()));
-        std::fs::rename(&path, &held).expect("rename owned socket");
+        let _ = std::fs::rename(&path, &held);
         let foreign = std::os::unix::net::UnixListener::bind(&path).expect("foreign socket");
         drop(daemon);
         assert!(
@@ -1464,6 +1468,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&held);
         let _ = std::fs::remove_file(lock_path_for(&path));
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[cfg(unix)]
@@ -1490,7 +1495,6 @@ mod tests {
     }
 }
 
-// Append this module to src/ipc.rs in an isolated audit checkout.
 // Regression: an uncertain external side effect must not dispatch twice.
 #[cfg(all(test, windows))]
 mod nine_point_audit {
