@@ -421,6 +421,7 @@ fn listen<T>(
         Ok(lock) => lock,
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
             || err.kind() == std::io::ErrorKind::ResourceBusy
+            || err.kind() == std::io::ErrorKind::AddrInUse
             || err.raw_os_error() == Some(11) // EAGAIN / EWOULDBLOCK
             || err.raw_os_error() == Some(16) // EBUSY
             =>
@@ -430,7 +431,16 @@ fn listen<T>(
         Err(err) => return Err(err.into()),
     };
     reclaim_unlocked_socket(&path)?;
-    let listener = tokio::net::UnixListener::bind(&path)?;
+    let listener = match tokio::net::UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse
+            || err.raw_os_error() == Some(98) // EADDRINUSE
+            =>
+        {
+            return Err(IpcError::Protocol("listen socket is already in use"));
+        }
+        Err(err) => return Err(err.into()),
+    };
     let socket_id = unix_file_id(&path)?;
     if let Err(err) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
         remove_our_socket(&path, socket_id);
