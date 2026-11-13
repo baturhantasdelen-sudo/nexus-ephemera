@@ -1,55 +1,53 @@
-name: CI
+name: Nexus-Ephemera CI (v0.2.0-sealed)
 
 on:
   push:
+    branches: [ main, master, release/* ]
   pull_request:
-  workflow_dispatch:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: ${{ matrix.os }}
+  validate:
+    name: Build, Clippy, Format & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    env:
-      RUSTFLAGS: "-D warnings"
-      CARGO_TERM_COLOR: always
+
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
+        rust: [stable]
 
-      - uses: dtolnay/rust-toolchain@stable
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: cargo fmt
+      - name: Check formatting (cargo fmt)
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy
+      - name: Run Clippy lints (-D warnings)
+        env:
+          CARGO_INCREMENTAL: 0
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run cargo test (debug)
+      - name: Run release test suite (including Linux fork & memlock probes)
         if: runner.os != 'Linux'
-        run: cargo test --workspace --all-targets
-
-      - name: Run cargo test (debug)
-        if: runner.os == 'Linux'
-        run: |
-          sudo prlimit --pid=$$ --memlock=unlimited:unlimited
-          cargo test --workspace --all-targets
-
-      - name: Run cargo test (release)
-        if: runner.os != 'Linux'
+        env:
+          RUSTFLAGS: "-D warnings"
         run: cargo test --workspace --release
 
-      - name: Run cargo test (release)
+      - name: Run release test suite (including Linux fork & memlock probes)
         if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           sudo prlimit --pid=$$ --memlock=unlimited:unlimited
-          RUSTFLAGS="-D warnings" cargo test --workspace --release
-
-      - name: cargo build (release)
-        run: cargo build --workspace --release
+          cargo test --workspace --release

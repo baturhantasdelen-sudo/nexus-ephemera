@@ -1,4 +1,12 @@
 //! Kendi kendini imha ve hassas bellek silme modülü.
+//!
+//! # Tehdit sınırı (Sensitive-Memory Lifecycle Protection)
+//! Kapsam içi: süreç içi tampon kaydı, kapanışta doğrulanan sıfırlama, log'a
+//! düz metin dökmeden wipe durumu. Okuma yolu önce işlem izni alır; apoptosis
+//! `ENGAGED` olduktan sonra izin reddedilir. Kapsam dışı: cold boot, DMA,
+//! fiziksel DRAM ve ayrıcalıklı `ptrace`. `mlock` bu okumaları kapatmaz.
+//! Kayıtlı bölgeler silinmeden süreç "temiz" sayılmaz; kilit açma hatası
+//! `WipeStatus::Partial` / `Failed` olarak kalır (fail-closed).
 
 #![forbid(unsafe_code)]
 
@@ -217,6 +225,9 @@ impl ExecutorRunGuard {
     }
 
     fn complete_with(&mut self, status: WipeStatus) {
+        if status == WipeStatus::Complete {
+            crate::metrics::record_wipe_success();
+        }
         WIPE_STATE.store(status as u8, Ordering::Release);
         self.finalized = true;
     }
@@ -719,6 +730,9 @@ impl SecureToken {
     }
 
     pub fn len(&self) -> usize {
+        let Ok(_permit) = acquire_operation_permit() else {
+            return 0;
+        };
         lock_or_recover(self.storage.as_ref()).inner.len()
     }
 
@@ -752,6 +766,17 @@ pub struct EphemeralBuffer {
     registry_id: u64,
 }
 
+/// Permit alındıktan sonra kilitli dilim. Guard düşünce kilit açılır; bayt kopyalanmaz.
+pub(crate) struct SensitiveRead<'a> {
+    guard: MutexGuard<'a, SensitivePayload>,
+}
+
+impl SensitiveRead<'_> {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.guard.inner.as_slice()
+    }
+}
+
 impl EphemeralBuffer {
     /// OsRng ile doldurulmuş kilitli oturum anahtarı (ara kopya yok).
     pub fn from_os_rng(len: usize) -> Result<Self, String> {
@@ -772,13 +797,27 @@ impl EphemeralBuffer {
         })
     }
 
+    /// Çağıran iş parçacığı izin tutmalıdır. İzin yoksa kilit alınmaz.
+    pub(crate) fn lock_sensitive(&self) -> Result<SensitiveRead<'_>, String> {
+        if !current_thread_holds_permit() {
+            return Err("sensitive read requires an operation permit".into());
+        }
+        Ok(SensitiveRead {
+            guard: lock_or_recover(self.storage.as_ref()),
+        })
+    }
+
     /// Kilitli bellek üzerinden işlem — düz metin kopyası üretmez.
+    /// İzin, tampon kilidinden önce alınır. `ENGAGED` okumayı reddeder.
     pub(crate) fn with_sensitive_bytes<R>(
         &self,
         f: impl FnOnce(&[u8]) -> Result<R, String>,
     ) -> Result<R, String> {
+        let _permit = acquire_operation_permit()?;
         let guard = lock_or_recover(self.storage.as_ref());
-        f(guard.inner.as_slice())
+        let result = f(guard.inner.as_slice());
+        drop(guard);
+        result
     }
 
     /// Kilitli alan üzerinde mutasyon — panik veya `Err` durumunda tampon sıfırlanır.
@@ -906,6 +945,9 @@ impl EphemeralBuffer {
     }
 
     pub fn len(&self) -> usize {
+        let Ok(_permit) = acquire_operation_permit() else {
+            return 0;
+        };
         lock_or_recover(self.storage.as_ref()).inner.len()
     }
 
@@ -915,11 +957,17 @@ impl EphemeralBuffer {
 
     /// Kilitli tampon hâlâ yazılabilir (silinmemiş / karantinada değil).
     pub(crate) fn memlock_accepts_writes(&self) -> bool {
+        let Ok(_permit) = acquire_operation_permit() else {
+            return false;
+        };
         lock_or_recover(self.storage.as_ref()).inner.is_active()
     }
 
     #[cfg(test)]
     fn pages_locked(&self) -> bool {
+        let Ok(_permit) = acquire_operation_permit() else {
+            return false;
+        };
         let _guard = lock_or_recover(self.storage.as_ref());
         drop(_guard);
         true
@@ -1146,8 +1194,12 @@ mod tests {
         reset_coordinator_for_tests();
 
         let token = SecureToken::new(vec![0xAB; 8]).expect("token");
+        let before = crate::metrics::snapshot().wipe_success_count;
         let _ = trigger_apoptosis();
         assert!(bytes_are_zeroed(&token.snapshot()));
+        if wipe_status() == WipeStatus::Complete {
+            assert!(crate::metrics::snapshot().wipe_success_count > before);
+        }
     }
 
     #[test]

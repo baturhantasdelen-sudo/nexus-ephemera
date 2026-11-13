@@ -1,4 +1,13 @@
 //! Fail-closed bellek kilitleme: önce tahsis, sonra OS kilidi, sonra veri yazımı.
+//!
+//! # Tehdit sınırı (Sensitive-Memory Lifecycle Protection)
+//! Kapsam içi: core dump, şifresiz swap/pagefile, `fork` sonrası adres alanı
+//! ve kilit aralığında adli kalıntı.
+//! Kapsam dışı: cold boot, DMA, fiziksel DRAM ve ayrıcalıklı `ptrace`.
+//! `mlock` / `VirtualLock` ve Linux `MADV_DONTDUMP` + `MADV_DONTFORK` yalnızca
+//! yönetilen aralığa uygulanır. Bu, `ptrace` veya donanım okumasını kapatmaz.
+//! `MADV_DONTFORK` çocuğa sıfır sayfa kopyalamaz; aralığı çocuğun adres
+//! uzayından çıkarır. Kısmi kilit açma karantinaya alır.
 
 #![allow(unsafe_code)]
 
@@ -418,6 +427,12 @@ fn align_offset(ptr: *const u8, page: usize) -> Result<usize, MemLockError> {
     Ok(offset)
 }
 
+/// Yükün kilitleneceği sayfa yuvarlanmış uzunluk. Boş yük bir sayfaya yuvarlanır.
+pub fn locked_span_for(len: usize) -> Result<usize, MemLockError> {
+    let page = page_size()?;
+    round_up_to_pages(len.max(1), page)
+}
+
 fn page_size() -> Result<usize, MemLockError> {
     static PAGE: OnceLock<Result<usize, MemLockError>> = OnceLock::new();
     match PAGE.get_or_init(sys::query_page_size) {
@@ -664,6 +679,109 @@ mod sys {
 
     pub fn unlock(_ptr: *mut u8, _len: usize) -> Result<(), MemLockError> {
         Err(MemLockError::UnlockFailed)
+    }
+}
+
+#[doc(hidden)]
+/// Linux'ta `MADV_DONTFORK` aralığının çocukta eşlenmemiş olduğunu ve
+/// `RLIMIT_MEMLOCK` tükenmesinin kontrollü hata verdiğini denetler.
+/// Çocuk baytları okumaz. Diğer platformlarda yoklama çalışmaz ve başarı döner.
+/// Cold boot, DMA ve ayrıcalıklı `ptrace` kapsam dışıdır. Kanarya yazdırılmaz.
+pub fn run_fork_assurance_probe() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_fork_assurance()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fork_assurance() -> Result<(), String> {
+    dontfork_child_range_is_unmapped()?;
+    rlimit_exhaustion_is_controlled()
+}
+
+#[cfg(target_os = "linux")]
+fn dontfork_child_range_is_unmapped() -> Result<(), String> {
+    const CANARY: &[u8] = b"NEXUS_FORK_CANARY_998877!!";
+    let buf = LockedBuffer::try_from_bytes(CANARY).map_err(|err| format!("lock: {err:?}"))?;
+    let page = page_size().map_err(|err| format!("page: {err:?}"))?;
+    // Kilit aralığının kendisi. Çocukta bu sayfalar VM_DONTCOPY ile devralınmaz.
+    let addr = unsafe { buf.backing.as_ptr().add(buf.data_offset) } as usize;
+    let len = buf.lock_span;
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err("fork failed".into());
+    }
+    if pid == 0 {
+        // `mincore` eşlenmemiş aralıkta okumadan ENOMEM/EFAULT döner.
+        // `read_volatile` bu adreste SIGSEGV üretir; çocuk baytlara dokunmaz.
+        let pages = len.div_ceil(page).max(1);
+        let mut resident = vec![0u8; pages];
+        let rc = unsafe { libc::mincore(addr as *mut libc::c_void, len, resident.as_mut_ptr()) };
+        let err = std::io::Error::last_os_error().raw_os_error();
+        let code = if rc == 0 {
+            1
+        } else if matches!(err, Some(libc::ENOMEM) | Some(libc::EFAULT)) {
+            0
+        } else {
+            2
+        };
+        unsafe { libc::_exit(code) };
+    }
+    let code = wait_child(pid)?;
+    drop(buf);
+    match code {
+        0 => Ok(()),
+        1 => Err("MADV_DONTFORK range is still mapped in the child".into()),
+        _ => Err("child could not probe the locked range safely".into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rlimit_exhaustion_is_controlled() -> Result<(), String> {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err("fork for rlimit probe failed".into());
+    }
+    if pid == 0 {
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) } != 0 {
+            unsafe { libc::_exit(3) };
+        }
+        let code = match std::panic::catch_unwind(|| LockedBuffer::try_from_bytes(b"rl")) {
+            Ok(Ok(_)) | Ok(Err(MemLockError::LockFailed | MemLockError::PrepareFailed)) => 0,
+            Ok(Err(_)) => 4,
+            Err(_) => 5,
+        };
+        unsafe { libc::_exit(code) };
+    }
+    match wait_child(pid)? {
+        0 => Ok(()),
+        3 => Err("could not lower RLIMIT_MEMLOCK".into()),
+        4 => Err("mlock under a zero limit returned an unexpected error".into()),
+        5 => Err("mlock under a zero limit panicked".into()),
+        other => Err(format!("rlimit child status {other}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_child(pid: libc::pid_t) -> Result<i32, String> {
+    let mut status = 0;
+    let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if rc < 0 {
+        return Err("waitpid failed".into());
+    }
+    if libc::WIFEXITED(status) {
+        Ok(libc::WEXITSTATUS(status))
+    } else {
+        Err(format!("child did not exit normally: {status}"))
     }
 }
 

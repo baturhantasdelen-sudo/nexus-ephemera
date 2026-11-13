@@ -1,13 +1,38 @@
 [workspace]
 resolver = "2"
-members = [".", "crates/memlock"]
+members = [".", "crates/memlock", "crates/ipc_os"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+authors = ["Baturhan Taşdelen <baturhantasdelen@gmail.com>"]
+repository = "https://github.com/baturhantasdelen-sudo/nexus-ephemera"
+keywords = [
+    "sensitive-memory",
+    "broker-daemon",
+    "process-isolation",
+    "idempotency",
+    "memlock",
+]
+categories = ["cryptography", "memory-management", "os"]
+
+[workspace.dependencies]
+nexus-ephemera-memlock = { version = "0.2.0", path = "crates/memlock" }
+nexus-ephemera-ipc-os = { version = "0.2.0", path = "crates/ipc_os" }
 
 [package]
 name = "nexus-ephemera"
-version = "0.1.0"
-edition = "2024"
-description = "Zero-footprint offline scout bot with AEAD mesh and apoptosis memory wipe"
-publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "Sensitive-memory lifecycle protection for offline scout, AEAD mesh, and brokered agent calls"
+exclude = ["crates/memlock/**", "crates/ipc_os/**", ".github/**"]
 
 [lib]
 name = "nexus_ephemera"
@@ -16,6 +41,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "nexus-ephemera"
 path = "src/main.rs"
+
+[[bin]]
+name = "nexus-daemon"
+path = "src/daemon_main.rs"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -30,10 +59,12 @@ sha2 = "0.10"
 base64 = "0.22"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 rand = "0.8"
-nexus-ephemera-memlock = { path = "crates/memlock" }
+nexus-ephemera-memlock.workspace = true
+nexus-ephemera-ipc-os.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt", "macros"] }
+zeroize = "1.7"
 
 # Üretim ikilisi: LTO + strip; panik unwind (apoptosis catch_unwind).
 [profile.release]
@@ -49,3 +80,7 @@ panic = "unwind"
 
 [profile.test]
 overflow-checks = true
+
+[[bench]]
+name = "lifecycle_bench"
+harness = false

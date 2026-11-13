@@ -1,10 +1,15 @@
 [package]
 name = "nexus-ephemera-memlock"
-version = "0.1.0"
-edition = "2024"
-description = "Safe page-lock wrappers (VirtualLock / mlock) for nexus-ephemera"
-publish = false
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "Fail-closed page locks for nexus-ephemera: mlock on Unix, VirtualLock on Windows"
+publish = true
 
 [dependencies]
 zeroize = { version = "1.7", features = ["derive"] }
@@ -20,3 +25,8 @@ windows-sys = { version = "0.59", features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[[test]]
+name = "linux_fork_probe"
+path = "probe/linux_fork_probe.rs"
+harness = false

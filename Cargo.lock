@@ -242,10 +242,11 @@ dependencies = [
 
 [[package]]
 name = "nexus-ephemera"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
+ "nexus-ephemera-ipc-os",
  "nexus-ephemera-memlock",
  "rand",
  "serde",
@@ -257,8 +258,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-ephemera-ipc-os"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "nexus-ephemera-memlock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
