@@ -43,7 +43,7 @@ jobs:
         if: runner.os != 'Linux'
         env:
           RUSTFLAGS: "-D warnings"
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release -- --test-threads=1
 
       - name: Run release test suite (including Linux fork & memlock probes)
         if: runner.os == 'Linux'
@@ -51,4 +51,4 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: |
           sudo prlimit --pid=$$ --memlock=unlimited:unlimited
-          cargo test --workspace --release
+          cargo test --workspace --release -- --test-threads=1

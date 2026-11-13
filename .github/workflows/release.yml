@@ -39,7 +39,7 @@ jobs:
           mkdir -p dist
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
             cp target/release/*.exe dist/ 2>/dev/null || true
-            cd dist && zip nexus-ephemera-${{ github.ref_name }}-${{ matrix.target }}.zip *.exe
+            cd dist && powershell Compress-Archive -Path *.exe -DestinationPath nexus-ephemera-${{ github.ref_name }}-${{ matrix.target }}.zip
           else
             cp target/release/nexus-* dist/ 2>/dev/null || true
             cd dist && tar -czf nexus-ephemera-${{ github.ref_name }}-${{ matrix.target }}.tar.gz nexus-*
