@@ -577,7 +577,7 @@ mod sys {
         }
         #[cfg(not(test))]
         {
-            return rc == 0;
+            rc == 0
         }
     }
 
