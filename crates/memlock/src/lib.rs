@@ -573,7 +573,7 @@ mod sys {
         let rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
         #[cfg(test)]
         {
-            return rc == 0 || eperm_graceful_fallback();
+            rc == 0 || eperm_graceful_fallback()
         }
         #[cfg(not(test))]
         {
