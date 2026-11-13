@@ -46,10 +46,7 @@ impl ListenLock {
         // SAFETY: `fd` is a new descriptor from `open`.
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         if file.metadata()?.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "listen lock path is a symlink",
-            ));
+            return Err(io::Error::other("listen lock path is a symlink"));
         }
         if file.metadata()?.mode() & 0o777 != 0o600 {
             return Err(io::Error::new(
