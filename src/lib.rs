@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod apoptosis;
+pub mod audit;
 pub use apoptosis::WipeStatus;
 pub mod broker;
 pub mod context;

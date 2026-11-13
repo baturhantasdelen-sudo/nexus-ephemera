@@ -17,11 +17,15 @@ pub(crate) const KEY_MAX: usize = 128;
 
 #[derive(Clone)]
 pub(crate) enum CachedBody {
+    /// Dispatch has started. A retry must not start a second one.
+    Pending,
     Done {
         receipt: TransactionReceipt,
         incomplete: bool,
     },
-    TransportFailed,
+    /// Never expire an uncertain side effect automatically. Reconciliation or
+    /// process restart is required; capacity exhaustion rejects new work.
+    Inconclusive,
 }
 
 struct Entry {
@@ -88,7 +92,10 @@ impl IdempotencyCache {
 
     fn sweep(&mut self) {
         let ttl = self.ttl;
-        self.map.retain(|_, entry| entry.stored.elapsed() < ttl);
+        self.map.retain(|_, entry| {
+            matches!(entry.body, CachedBody::Inconclusive | CachedBody::Pending)
+                || entry.stored.elapsed() < ttl
+        });
     }
 }
 
@@ -103,9 +110,7 @@ impl CachedBody {
                 receipt,
                 incomplete: true,
             } => Err(IpcError::CleanupIncomplete(receipt.clone())),
-            Self::TransportFailed => Err(IpcError::Broker(BrokerError::Transport(
-                "idempotent replay",
-            ))),
+            Self::Pending | Self::Inconclusive => Err(IpcError::Inconclusive),
         }
     }
 
@@ -121,7 +126,10 @@ impl CachedBody {
                 receipt: receipt.clone(),
                 incomplete: true,
             }),
-            Err(IpcError::Broker(BrokerError::Transport(_))) => Some(Self::TransportFailed),
+            Err(IpcError::Inconclusive | IpcError::TimedOut)
+            | Err(IpcError::Broker(BrokerError::Transport(_) | BrokerError::Inconclusive)) => {
+                Some(Self::Inconclusive)
+            }
             _ => None,
         }
     }
@@ -214,7 +222,10 @@ mod tests {
             "same-key",
             "https://provider.example/charge",
             "hash-a",
-            CachedBody::TransportFailed,
+            CachedBody::Done {
+                receipt: receipt("hash-a"),
+                incomplete: false,
+            },
         );
         thread::sleep(Duration::from_millis(5));
         assert!(matches!(
@@ -227,11 +238,51 @@ mod tests {
             "one",
             "https://provider.example/charge",
             "hash-a",
-            CachedBody::TransportFailed,
+            CachedBody::Done {
+                receipt: receipt("hash-a"),
+                incomplete: false,
+            },
         );
         assert!(matches!(
             limited.lookup("two", "https://provider.example/charge", "hash-a"),
             Lookup::Full
+        ));
+    }
+    #[test]
+    fn uncertain_side_effect_never_expires_or_allows_key_rebinding() {
+        let mut cache = IdempotencyCache::new(Duration::ZERO, 1);
+        cache.commit("key", "endpoint", "hash", CachedBody::Inconclusive);
+        assert!(matches!(
+            cache.lookup("key", "endpoint", "hash"),
+            Lookup::Replay(Err(IpcError::Inconclusive))
+        ));
+        assert!(matches!(
+            cache.lookup("key", "other", "hash"),
+            Lookup::Conflict
+        ));
+        assert!(matches!(
+            cache.lookup("new", "endpoint", "hash"),
+            Lookup::Full
+        ));
+    }
+
+    #[test]
+    fn pending_and_inconclusive_reject_a_second_dispatch() {
+        let mut cache = IdempotencyCache::new(Duration::from_millis(1), 4);
+        cache.commit("key", "endpoint", "hash", CachedBody::Pending);
+        thread::sleep(Duration::from_millis(5));
+        assert!(matches!(
+            cache.lookup("key", "endpoint", "hash"),
+            Lookup::Replay(Err(IpcError::Inconclusive))
+        ));
+        cache.commit("key", "endpoint", "hash", CachedBody::Inconclusive);
+        assert!(matches!(
+            cache.lookup("key", "endpoint", "hash"),
+            Lookup::Replay(Err(IpcError::Inconclusive))
+        ));
+        assert!(matches!(
+            cache.lookup("key", "endpoint", "other-hash"),
+            Lookup::Conflict
         ));
     }
 }

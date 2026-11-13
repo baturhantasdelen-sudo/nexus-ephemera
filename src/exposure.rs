@@ -210,6 +210,13 @@ impl Drop for LogSanitizer {
     }
 }
 
+// Equal-length byte comparisons use a maintained constant-time primitive.
+// Scanning, UTF-8 boundaries and output lengths remain data-dependent.
+fn constant_eq(left: &[u8], right: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    bool::from(left.ct_eq(right))
+}
+
 fn redact_all(haystack: &str, needles: &[&[u8]]) -> String {
     let mut out = Zeroizing::new(String::with_capacity(haystack.len()));
     let bytes = haystack.as_bytes();
@@ -226,7 +233,7 @@ fn redact_all(haystack: &str, needles: &[&[u8]]) -> String {
             let end = start.saturating_add(needle.len());
             let hits = end <= bytes.len()
                 && haystack.is_char_boundary(end)
-                && &bytes[start..end] == *needle;
+                && constant_eq(&bytes[start..end], needle);
             if hits {
                 matched_end = Some(matched_end.map_or(end, |prev: usize| prev.max(end)));
             }

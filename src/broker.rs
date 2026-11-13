@@ -4,7 +4,7 @@
 //! uç nokta, yük özeti, süreç içi nonce ve bağ özeti gider. Bağ özeti bir MAC
 //! veya mTLS değildir; süreç içi IPC/API sınırıdır. `SingleUse` yetkisi taşıyıcı
 //! çağrısından önce tüketilir ve panikte `Drop` anahtarı siler. İşlem izni
-//! özet, `dispatch` ve mühür bitene kadar tutulur. `Partial` veya `Failed`
+//! özet ve mühür aşamalarında tutulur; dış taşıyıcı çağrısında tutulmaz. `Partial` veya `Failed`
 //! mühür fişte gizlenmez. `ExpiresAt` süresi dolunca kasayı kapatır.
 //! `ProviderBound` başka ucu reddeder.
 //! `LocalOnly` ağ çağrısına çıkmaz.
@@ -78,6 +78,31 @@ impl SealReport {
 
     fn is_failure(self) -> bool {
         matches!(self, Self::Partial | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Owned call material for a provider invocation that runs off the runtime.
+///
+/// The secret is not in this value. The permit is not held while it is in flight.
+pub(crate) struct PendingDispatch {
+    pub command: ExecuteWithPolicy,
+    pub digest: String,
+    pub nonce: u64,
+    pub issued_at_unix_ms: u64,
+    pub single_use: bool,
+}
+
+impl PendingDispatch {
+    pub(crate) fn as_call(&self) -> AuthorizedCall<'_> {
+        AuthorizedCall {
+            target_endpoint: &self.command.target_endpoint,
+            payload_hash: &self.command.payload_hash,
+            binding_digest_hex: &self.digest,
+            call_nonce: self.nonce,
+            issued_at_unix_ms: self.issued_at_unix_ms,
+            idempotency_key: &self.command.idempotency_key,
+        }
     }
 }
 
@@ -163,6 +188,27 @@ impl SecureTransactionAgent {
         command: ExecuteWithPolicy,
         transport: &mut impl SecureTransport,
     ) -> Result<TransactionReceipt, BrokerError> {
+        let pending = self.begin_dispatch(command)?;
+        let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            transport.dispatch(&pending.as_call())
+        }));
+        match reply {
+            Ok(reply) => self.end_dispatch(pending, reply),
+            Err(payload) => {
+                // Seal a single-use authority before the panic leaves this frame.
+                let _ = self.end_dispatch(pending, Err(BrokerError::Inconclusive));
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    /// Checks, digest, and single-use consume. The permit covers only this
+    /// section. The provider call runs after the permit drops.
+    pub(crate) fn begin_dispatch(
+        &mut self,
+        command: ExecuteWithPolicy,
+    ) -> Result<PendingDispatch, BrokerError> {
+        let _permit = apoptosis::acquire_operation_permit().map_err(BrokerError::Memlock)?;
         if command.context_id != self.ctx.task_id() {
             return Err(BrokerError::ContextMismatch);
         }
@@ -195,9 +241,11 @@ impl SecureTransactionAgent {
             Scope::Allowlist { .. } => {}
         }
 
-        // İzin, özetten dispatch'in dönüşüne ve mühür bitimine kadar durur.
-        let _permit = apoptosis::acquire_operation_permit().map_err(BrokerError::Memlock)?;
-        let nonce = CALL_NONCE.fetch_add(1, Ordering::Relaxed);
+        let nonce = CALL_NONCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| BrokerError::Sealed)?;
         let issued_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
@@ -215,25 +263,37 @@ impl SecureTransactionAgent {
             return Err(self.refuse_engaged(command, digest));
         }
         let single_use = self.tags.single_use;
-        let cleanup = SingleUseCleanup {
-            armed: single_use,
-            consumed: &mut self.consumed,
-            sanitizer: &mut self.sanitizer,
-            ctx: &mut self.ctx,
-        };
         if single_use {
-            *cleanup.consumed = true;
+            self.consumed = true;
         }
-        let reply = transport.dispatch(&AuthorizedCall {
-            target_endpoint: &command.target_endpoint,
-            payload_hash: &command.payload_hash,
-            binding_digest_hex: &digest,
-            call_nonce: nonce,
+        Ok(PendingDispatch {
+            command,
+            digest,
+            nonce,
             issued_at_unix_ms,
-            idempotency_key: &command.idempotency_key,
-        });
+            single_use,
+        })
+    }
+
+    /// Seal after the provider returns. A missing permit means apoptosis ran
+    /// during the call; the outcome is not a successful receipt.
+    pub(crate) fn end_dispatch(
+        &mut self,
+        pending: PendingDispatch,
+        reply: Result<TransportReply, BrokerError>,
+    ) -> Result<TransactionReceipt, BrokerError> {
+        let PendingDispatch {
+            command,
+            digest,
+            single_use,
+            ..
+        } = pending;
+        let _permit = match apoptosis::acquire_operation_permit() {
+            Ok(permit) => permit,
+            Err(_) => return Err(self.refuse_engaged(command, digest)),
+        };
         let seal_report = if single_use {
-            SealReport::from_status(cleanup.finish())
+            SealReport::from_status(self.settle_secret())
         } else {
             SealReport::Retained
         };
@@ -316,37 +376,6 @@ impl SecureTransactionAgent {
     }
 }
 
-/// `SingleUse` taşıyıcı paniklese de anahtarı siler. Başarı yolunda `finish` etkisiz bırakır.
-struct SingleUseCleanup<'a> {
-    armed: bool,
-    consumed: &'a mut bool,
-    sanitizer: &'a mut LogSanitizer,
-    ctx: &'a mut EphemeralContext,
-}
-
-impl Drop for SingleUseCleanup<'_> {
-    fn drop(&mut self) {
-        self.consume();
-    }
-}
-
-impl SingleUseCleanup<'_> {
-    fn finish(mut self) -> AuditStatus {
-        self.consume()
-    }
-
-    fn consume(&mut self) -> AuditStatus {
-        if !self.armed {
-            return AuditStatus::Complete;
-        }
-        self.armed = false;
-        *self.consumed = true;
-        let failed = self.sanitizer.wipe();
-        self.ctx.note_external_quarantine(failed);
-        self.ctx.seal().final_status
-    }
-}
-
 impl fmt::Display for SecureTransactionAgent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SecureTransactionAgent([REDACTED])")
@@ -377,8 +406,10 @@ fn digest_hex(
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key);
-    hasher.update(endpoint.as_bytes());
-    hasher.update(payload_hash.as_bytes());
+    // Versioned, length-prefixed fields. `ab`+`c` and `a`+`bc` no longer collide.
+    hasher.update(b"v1");
+    write_len_prefixed(&mut hasher, endpoint.as_bytes());
+    write_len_prefixed(&mut hasher, payload_hash.as_bytes());
     hasher.update(nonce.to_le_bytes());
     hasher.update(issued_at_unix_ms.to_le_bytes());
     let digest = hasher.finalize();
@@ -388,6 +419,12 @@ fn digest_hex(
         hex.push(HEX[(byte & 0x0f) as usize] as char);
     }
     hex
+}
+
+fn write_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    hasher.update(len.to_le_bytes());
+    hasher.update(bytes);
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -407,6 +444,8 @@ pub enum BrokerError {
     Context(&'static str),
     Memlock(String),
     ApoptosisEngaged,
+    /// The provider outcome is unknown. Preserve a reservation before retrying.
+    Inconclusive,
     CleanupIncomplete(TransactionReceipt),
 }
 
@@ -454,6 +493,7 @@ impl fmt::Display for BrokerError {
             Self::ApoptosisEngaged => {
                 write!(f, "broker: apoptosis engaged before dispatch")
             }
+            Self::Inconclusive => write!(f, "broker: provider outcome is inconclusive"),
             Self::CleanupIncomplete(receipt) => write!(
                 f,
                 "broker: cleanup {:?} after transport {}",
@@ -616,10 +656,10 @@ mod tests {
         );
     }
 
-    /// Tehdit: dispatch sürerken başka iş parçacığı apoptosis'i bitirir.
-    /// Sınır: izin kalkmadan wipe terminal olmaz; context dispatch içinde kapanmaz.
+    /// Tehdit: yavaş sağlayıcı global wipe'ı izin arkasında bekletir.
+    /// Sınır: taşıyıcı çağrısı izni tutmaz; wipe dispatch bitmeden terminal olabilir.
     #[test]
-    fn dispatch_blocks_apoptosis_until_permit_drops() {
+    fn dispatch_does_not_hold_the_wipe_permit() {
         let _guard = apoptosis::test_serial();
         apoptosis::reset_coordinator_for_tests();
 
@@ -631,14 +671,17 @@ mod tests {
         .expect("admit");
         let cmd = command(&agent, "https://provider.example/charge");
         let mut transport = ApoptosisDuringDispatch::default();
-        let receipt = agent.execute(cmd, &mut transport).expect("execute");
+        let outcome = agent.execute(cmd, &mut transport);
         assert!(
             transport
-                .wipe_waited
-                .load(std::sync::atomic::Ordering::SeqCst)
+                .wipe_finished
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "wipe stayed blocked for the whole provider call"
         );
-        assert_eq!(receipt.transport_status, 202);
-        assert_eq!(receipt.seal_report, SealReport::Complete);
+        assert!(
+            outcome.is_err(),
+            "a finished wipe is not a successful receipt"
+        );
         assert_eq!(agent.lifecycle_state(), LifecycleState::Closed);
         let joined = transport
             .joiner
@@ -679,6 +722,50 @@ mod tests {
         let _ = apoptosis::wait_apoptosis_complete(Duration::from_secs(10));
     }
 
+    #[test]
+    fn inconclusive_provider_does_not_hide_partial_cleanup() {
+        let _guard = apoptosis::test_serial();
+        apoptosis::reset_coordinator_for_tests();
+        let mut agent = SecureTransactionAgent::admit(
+            b"partial-secret",
+            ExposureTags::provider_bound("https://provider.example/charge", true, None)
+                .expect("tags"),
+        )
+        .expect("admit");
+        let cmd = command(&agent, "https://provider.example/charge");
+        let pending = agent.begin_dispatch(cmd).expect("pending");
+        agent.fail_next_seal_for_tests();
+        assert!(
+            matches!(agent.end_dispatch(pending, Err(BrokerError::Inconclusive)), Err(BrokerError::CleanupIncomplete(receipt)) if receipt.seal_report == SealReport::Partial)
+        );
+        let _ = apoptosis::wait_apoptosis_complete(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn split_dispatch_cannot_bypass_single_use_or_provider_policy() {
+        let _guard = apoptosis::test_serial();
+        apoptosis::reset_coordinator_for_tests();
+        let mut agent = SecureTransactionAgent::admit(
+            b"policy-key",
+            ExposureTags::provider_bound("https://provider.example/charge", true, None)
+                .expect("tags"),
+        )
+        .expect("admit");
+        let wrong = command(&agent, "https://other.example/charge");
+        assert!(matches!(
+            agent.begin_dispatch(wrong),
+            Err(BrokerError::ProviderMismatch)
+        ));
+        let first = command(&agent, "https://provider.example/charge");
+        let pending = agent.begin_dispatch(first).expect("first");
+        let second = command(&agent, "https://provider.example/charge");
+        assert!(matches!(
+            agent.begin_dispatch(second),
+            Err(BrokerError::SingleUseConsumed)
+        ));
+        let _ = agent.end_dispatch(pending, Err(BrokerError::Inconclusive));
+    }
+
     /// Tehdit: gerçekçi istek arabelleği sır taşır veya kısmi mühür 200 ile yutulur.
     /// Sınır: gövde sıfırlanır ve `execute` `CleanupIncomplete` döner.
     #[test]
@@ -713,7 +800,7 @@ mod tests {
     }
 
     struct ApoptosisDuringDispatch {
-        wipe_waited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        wipe_finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
         joiner: Option<
             std::thread::JoinHandle<Result<apoptosis::WipeStatus, apoptosis::ApoptosisError>>,
         >,
@@ -722,7 +809,7 @@ mod tests {
     impl Default for ApoptosisDuringDispatch {
         fn default() -> Self {
             Self {
-                wipe_waited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                wipe_finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 joiner: None,
             }
         }
@@ -730,18 +817,17 @@ mod tests {
 
     impl SecureTransport for ApoptosisDuringDispatch {
         fn dispatch(&mut self, _: &AuthorizedCall<'_>) -> Result<TransportReply, BrokerError> {
-            let flag = std::sync::Arc::clone(&self.wipe_waited);
+            let flag = std::sync::Arc::clone(&self.wipe_finished);
             self.joiner = Some(std::thread::spawn(apoptosis::trigger_apoptosis));
             let start = std::time::Instant::now();
-            while !apoptosis::is_shutting_down() && start.elapsed() < Duration::from_secs(2) {
+            while !apoptosis::wipe_status().is_terminal()
+                && start.elapsed() < Duration::from_secs(2)
+            {
                 std::thread::yield_now();
             }
-            let waited = apoptosis::is_shutting_down() && !apoptosis::wipe_status().is_terminal();
-            flag.store(waited, std::sync::atomic::Ordering::SeqCst);
-            assert!(
-                waited,
-                "apoptosis finished while the broker still held the dispatch permit"
-            );
+            let finished = apoptosis::wipe_status().is_terminal();
+            flag.store(finished, std::sync::atomic::Ordering::SeqCst);
+            assert!(finished, "provider dispatch still blocked the global wipe");
             Ok(TransportReply { status: 202 })
         }
     }

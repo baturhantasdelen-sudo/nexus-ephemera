@@ -45,10 +45,23 @@ impl ListenLock {
         }
         // SAFETY: `fd` is a new descriptor from `open`.
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        if file.metadata()?.file_type().is_symlink() {
-            return Err(io::Error::other("listen lock path is a symlink"));
+        let meta = file.metadata()?;
+        if meta.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "listen lock must have exactly one hard link",
+            ));
         }
-        if file.metadata()?.mode() & 0o777 != 0o600 {
+        if !meta.file_type().is_file() {
+            return Err(io::Error::other("listen lock path is not a regular file"));
+        }
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "listen lock is not owned by this uid",
+            ));
+        }
+        if meta.mode() & 0o777 != 0o600 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "listen lock path must be mode 0600",
@@ -132,7 +145,9 @@ fn read_stdin_bounded_inner(
                     "stdin read deadline already passed",
                 ));
             }
-            let wait_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            let wait_ms = i32::try_from(remaining.as_millis().min(10))
+                .unwrap_or(10)
+                .max(1);
             let mut poll_fd = libc::pollfd {
                 fd: libc::STDIN_FILENO,
                 events: libc::POLLIN,
@@ -140,10 +155,7 @@ fn read_stdin_bounded_inner(
             };
             let rc = unsafe { libc::poll(&mut poll_fd, 1, wait_ms) };
             if rc == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "stdin read deadline already passed",
-                ));
+                continue;
             }
             if rc < 0 {
                 let err = io::Error::last_os_error();
@@ -210,17 +222,15 @@ mod windows {
 
     use std::ptr;
 
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GENERIC_MAPPING,
-        GROUP_SECURITY_INFORMATION, GetAce, GetTokenInformation, MapGenericMask,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION,
+        GetAce, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
     };
 
     #[link(name = "kernel32")]
@@ -245,12 +255,16 @@ mod windows {
     /// unmapped `GENERIC_*`, because client access checks use file mapping.
     const FILE_GENERIC_READ: u32 = 0x0012_0089;
     const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
-    const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
-    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
-    /// Lets this user create the next instance with duplex access, not `WRITE_DAC`.
+    /// Same bit as `FILE_FLAG_FIRST_PIPE_INSTANCE`. The first `CreateNamedPipe`
+    /// therefore requests this right, and returns error 5 if the ACE omits it.
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    /// Lets this user create the next instance. Without it the second create
+    /// is also error 5.
     const FILE_CREATE_PIPE_INSTANCE: u32 = 0x4;
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACL_REVISION: u32 = 2;
+    const SYSTEM_MANDATORY_LABEL_NO_WRITE_UP: u32 = 1;
 
     #[link(name = "advapi32")]
     unsafe extern "system" {
@@ -303,11 +317,12 @@ mod windows {
         Ok(PipePeer { pid, same_user })
     }
 
-    /// Replace the pipe DACL so the current user is the owner and the only allow ACE.
+    /// Apply the exact current-user and optional current-package DACL.
     ///
     /// The ACE trustee is the `TokenUser` SID from `OpenProcessToken` on the
     /// current process, not a static well-known SID. Remote clients are a
-    /// separate `PIPE_REJECT_REMOTE_CLIENTS` flag on create. A privileged
+    /// AppContainer processes also require their exact package SID. Remote
+    /// rejection uses `PIPE_REJECT_REMOTE_CLIENTS` on create. A privileged
     /// administrator can still open the process. This is not mTLS.
     pub fn assert_pipe_dacl_is_current_user_only(handle: isize) -> io::Result<()> {
         let handle = handle as HANDLE;
@@ -344,21 +359,163 @@ mod windows {
         Err(io::Error::other("pipe owner dacl was not applied"))
     }
 
+    /// Create with the restrictive descriptor already installed. No interval
+    /// exists where the first instance uses the inherited default DACL.
+    /// Requires a Tokio I/O runtime, just like ServerOptions::create.
+    pub fn create_user_only_pipe(
+        name: &str,
+        first: bool,
+    ) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        use windows_sys::Win32::Security::{
+            InitializeSecurityDescriptor, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+            SetSecurityDescriptorDacl, SetSecurityDescriptorGroup, SetSecurityDescriptorOwner,
+            SetSecurityDescriptorSacl,
+        };
+        let (sid, _storage, _token) = current_process_user_sid()?;
+        let mut acl = user_only_acl(sid)?;
+        let mut sacl = process_integrity_sacl()?;
+        // SAFETY: all-zero storage is only passed to InitializeSecurityDescriptor;
+        // no fields are read before successful initialization.
+        let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let ptr = std::ptr::from_mut(&mut descriptor).cast();
+        // SAFETY: descriptor, ACL, SID backing storage and attributes remain live
+        // for the synchronous create call. Handles are not inherited.
+        unsafe {
+            if InitializeSecurityDescriptor(ptr, 1) == 0
+                || SetSecurityDescriptorOwner(ptr, sid, 0) == 0
+                || SetSecurityDescriptorGroup(ptr, sid, 0) == 0
+                || SetSecurityDescriptorDacl(ptr, 1, acl.as_mut_ptr(), 0) == 0
+                || SetSecurityDescriptorSacl(ptr, 1, sacl.as_mut_ptr(), 0) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr,
+            bInheritHandle: 0,
+        };
+        let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
+        options
+            .reject_remote_clients(true)
+            .first_pipe_instance(first);
+        if first {
+            // FIRST_PIPE_INSTANCE shares its bit with WRITE_OWNER. Request both
+            // owner and DACL rights explicitly so the opened handle can carry them.
+            options.write_dac(true).write_owner(true);
+        }
+        let server = unsafe {
+            options.create_with_security_attributes_raw(
+                name,
+                std::ptr::from_mut(&mut attributes).cast(),
+            )
+        }?;
+        use std::os::windows::io::AsRawHandle;
+        assert_pipe_dacl_is_current_user_only(server.as_raw_handle() as isize)?;
+        assert_pipe_integrity_matches_process(server.as_raw_handle() as HANDLE)?;
+        Ok(server)
+    }
+
     const SYNCHRONIZE: u32 = 0x0010_0000;
 
     fn client_access_mask() -> u32 {
-        let mut mask = GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE;
-        let mapping = GENERIC_MAPPING {
-            GenericRead: FILE_GENERIC_READ,
-            GenericWrite: FILE_GENERIC_WRITE,
-            GenericExecute: FILE_GENERIC_EXECUTE,
-            GenericAll: FILE_ALL_ACCESS,
-        };
-        unsafe { MapGenericMask(&mut mask, &mapping) };
-        mask | FILE_CREATE_PIPE_INSTANCE
+        FILE_GENERIC_READ
+            | FILE_GENERIC_WRITE
+            | SYNCHRONIZE
+            | WRITE_DAC
+            | WRITE_OWNER
+            | FILE_CREATE_PIPE_INSTANCE
     }
 
-    struct HeapAcl(Vec<u8>);
+    /// Explicitly preserve the creator's integrity level. An absolute descriptor
+    /// with no mandatory label is treated as medium, even in a low-IL process.
+    /// Never lower a medium/high service's label to accommodate a low client.
+    fn process_integrity_sacl() -> io::Result<HeapAcl> {
+        use windows_sys::Win32::Security::{
+            AddMandatoryAce, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel,
+        };
+        let token = open_token(unsafe { GetCurrentProcess() })?;
+        let storage = token_info_bytes(token.0, TokenIntegrityLevel)?;
+        // SAFETY: successful TokenIntegrityLevel query returns this structure;
+        // aligned storage remains live until AddMandatoryAce copies its SID.
+        let sid = unsafe {
+            (*storage.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())
+                .Label
+                .Sid
+        };
+        let bytes = std::mem::size_of::<ACL>() + 8 + unsafe { GetLengthSid(sid) } as usize;
+        let mut acl = HeapAcl(vec![0u32; bytes.div_ceil(4)]);
+        unsafe {
+            if InitializeAcl(acl.as_mut_ptr(), bytes as u32, ACL_REVISION) == 0
+                || AddMandatoryAce(
+                    acl.as_mut_ptr(),
+                    ACL_REVISION,
+                    0,
+                    SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+                    sid,
+                ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(acl)
+    }
+
+    fn assert_pipe_integrity_matches_process(handle: HANDLE) -> io::Result<()> {
+        use windows_sys::Win32::Security::{
+            LABEL_SECURITY_INFORMATION, SYSTEM_MANDATORY_LABEL_ACE,
+        };
+        let mut sacl = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut sacl,
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _descriptor = LocalAlloc(descriptor);
+        if sacl.is_null() || unsafe { (*sacl).AceCount } != 1 {
+            return Err(io::Error::other("pipe mandatory label missing"));
+        }
+        let mut ace = ptr::null_mut();
+        if unsafe { GetAce(sacl, 0, &mut ace) } == 0 || ace.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let actual = unsafe { &*ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>() };
+        if actual.Header.AceType != 0x11 || actual.Mask != SYSTEM_MANDATORY_LABEL_NO_WRITE_UP {
+            return Err(io::Error::other("unexpected pipe integrity policy"));
+        }
+        let mut expected = process_integrity_sacl()?;
+        let mut expected_ace = ptr::null_mut();
+        if unsafe { GetAce(expected.as_mut_ptr(), 0, &mut expected_ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both ACLs are system-validated and have a mandatory label ACE.
+        let equal = unsafe {
+            EqualSid(
+                ace.byte_add(std::mem::offset_of!(SYSTEM_MANDATORY_LABEL_ACE, SidStart))
+                    .cast(),
+                expected_ace
+                    .byte_add(std::mem::offset_of!(SYSTEM_MANDATORY_LABEL_ACE, SidStart))
+                    .cast(),
+            )
+        };
+        if equal == 0 {
+            return Err(io::Error::other("pipe and process integrity levels differ"));
+        }
+        Ok(())
+    }
+
+    struct HeapAcl(Vec<u32>);
 
     impl HeapAcl {
         fn as_mut_ptr(&mut self) -> *mut ACL {
@@ -366,24 +523,63 @@ mod windows {
         }
     }
 
-    /// Build a one-ACE DACL with `AddAccessAllowedAce` for the given user SID.
+    /// Package identity is a second access-check principal for AppContainers.
+    /// Admit only this process's package, never ALL APPLICATION PACKAGES.
+    fn process_appcontainer_storage() -> io::Result<Option<Vec<u64>>> {
+        use windows_sys::Win32::Security::{TokenAppContainerSid, TokenIsAppContainer};
+        let token = open_token(unsafe { GetCurrentProcess() })?;
+        let flag = token_info_bytes(token.0, TokenIsAppContainer)?;
+        if unsafe { *flag.as_ptr().cast::<u32>() } == 0 {
+            return Ok(None);
+        }
+        let storage = token_info_bytes(token.0, TokenAppContainerSid)?;
+        if appcontainer_sid(&storage).is_null() {
+            return Err(io::Error::other("AppContainer SID missing"));
+        }
+        Ok(Some(storage))
+    }
+
+    fn appcontainer_sid(storage: &[u64]) -> PSID {
+        // SAFETY: callers supply a successful, aligned TokenAppContainerSid query.
+        unsafe {
+            (*storage
+                .as_ptr()
+                .cast::<windows_sys::Win32::Security::TOKEN_APPCONTAINER_INFORMATION>())
+            .TokenAppContainer
+        }
+    }
+
     fn user_only_acl(sid: PSID) -> io::Result<HeapAcl> {
-        let sid_len = unsafe { GetLengthSid(sid) };
-        let ace_size = (std::mem::size_of::<ACCESS_ALLOWED_ACE>() as u32)
-            .saturating_sub(4)
-            .saturating_add(sid_len);
-        let acl_size = (std::mem::size_of::<ACL>() as u32).saturating_add(ace_size);
-        let mut buffer = vec![0u8; acl_size as usize];
-        let acl = buffer.as_mut_ptr().cast::<ACL>();
-        let init = unsafe { InitializeAcl(acl, acl_size, ACL_REVISION) };
-        if init == 0 {
-            return Err(io::Error::last_os_error());
+        let package = process_appcontainer_storage()?;
+        let mut trustees = vec![sid];
+        if let Some(storage) = &package {
+            trustees.push(appcontainer_sid(storage));
         }
-        let add = unsafe { AddAccessAllowedAce(acl, ACL_REVISION, client_access_mask(), sid) };
-        if add == 0 {
-            return Err(io::Error::last_os_error());
+        let acl_size = std::mem::size_of::<ACL>()
+            + trustees
+                .iter()
+                .map(|sid| 8 + unsafe { GetLengthSid(*sid) } as usize)
+                .sum::<usize>();
+        let mut acl = HeapAcl(vec![0u32; acl_size.div_ceil(4)]);
+        // SAFETY: aligned ACL storage is sized for each validated token SID;
+        // AddAccessAllowedAce copies the SIDs while backing storage is live.
+        unsafe {
+            if InitializeAcl(acl.as_mut_ptr(), acl_size as u32, ACL_REVISION) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for trustee in trustees {
+                if AddAccessAllowedAce(
+                    acl.as_mut_ptr(),
+                    ACL_REVISION,
+                    client_access_mask(),
+                    trustee,
+                ) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
         }
-        Ok(HeapAcl(buffer))
+        Ok(acl)
     }
 
     fn dacl_is_current_user_only(handle: HANDLE, object_type: SE_OBJECT_TYPE) -> io::Result<()> {
@@ -417,35 +613,33 @@ mod windows {
         if owner_match == 0 {
             return Err(io::Error::other("pipe owner is not the current user"));
         }
-        let ace_count = unsafe { (*dacl).AceCount };
-        if ace_count != 1 {
-            return Err(io::Error::other(
-                "pipe dacl is not a single current-user ace",
-            ));
+        let package = process_appcontainer_storage()?;
+        let mut trustees = vec![current_sid];
+        if let Some(storage) = &package {
+            trustees.push(appcontainer_sid(storage));
         }
-        let mut ace: *mut std::ffi::c_void = ptr::null_mut();
-        let ok = unsafe { GetAce(dacl, 0, &mut ace) };
-        if ok == 0 || ace.is_null() {
-            return Err(io::Error::other("pipe dacl ace is unreadable"));
+        if unsafe { (*dacl).AceCount } as usize != trustees.len() {
+            return Err(io::Error::other("unexpected pipe DACL trustees"));
         }
-        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-        if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
-            return Err(io::Error::other("pipe dacl ace is not an allow"));
-        }
-        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-        let expected = client_access_mask();
-        if allowed.Mask & expected != expected {
-            return Err(io::Error::other(
-                "pipe dacl ace mask is not the expected rights",
-            ));
-        }
-        let sid = unsafe {
-            ace.byte_add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
-                .cast()
-        };
-        let ace_match = unsafe { EqualSid(sid, current_sid) };
-        if ace_match == 0 {
-            return Err(io::Error::other("pipe dacl ace is not the current user"));
+        for (index, expected_sid) in trustees.into_iter().enumerate() {
+            let mut ace = ptr::null_mut();
+            if unsafe { GetAce(dacl, index as u32, &mut ace) } == 0 || ace.is_null() {
+                return Err(io::Error::other("pipe ACE unreadable"));
+            }
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            if allowed.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                || allowed.Header.AceFlags != 0
+                || allowed.Mask != client_access_mask()
+            {
+                return Err(io::Error::other("unexpected pipe ACE rights"));
+            }
+            let sid = unsafe {
+                ace.byte_add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                    .cast()
+            };
+            if unsafe { EqualSid(sid, expected_sid) } == 0 {
+                return Err(io::Error::other("unexpected pipe ACE identity"));
+            }
         }
         Ok(())
     }
@@ -531,7 +725,8 @@ mod windows {
             let err = io::Error::last_os_error();
             return match err.raw_os_error() {
                 Some(109) => Ok(StdinPoll::Eof),
-                Some(87) | Some(6) => read_stdin_handle(handle, out, cancel),
+                // Console and unsupported handles must not fall through to a
+                // blocking ReadFile. A deadline cannot be kept that way.
                 _ => Err(err),
             };
         }
@@ -618,9 +813,15 @@ mod windows {
     }
 
     fn token_user_bytes(token: HANDLE) -> io::Result<Vec<u64>> {
+        token_info_bytes(token, TokenUser)
+    }
+
+    fn token_info_bytes(
+        token: HANDLE,
+        class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+    ) -> io::Result<Vec<u64>> {
         let mut needed = 0u32;
-        let _ =
-            unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        let _ = unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut needed) };
         if needed == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -631,7 +832,7 @@ mod windows {
         let ok = unsafe {
             GetTokenInformation(
                 token,
-                TokenUser,
+                class,
                 buffer.as_mut_ptr().cast::<c_void>(),
                 cap,
                 &mut needed,
@@ -725,7 +926,8 @@ mod windows {
         #[allow(dead_code)]
         pub struct PipeSecurityAttributes {
             pub security_descriptor: Vec<u8>,
-            pub acl: Vec<u8>,
+            pub acl: Vec<u32>,
+            _sacl: HeapAcl,
             pub attributes: SECURITY_ATTRIBUTES,
             _sid_storage: Vec<u64>,
             _token: Owned,
@@ -744,6 +946,18 @@ mod windows {
                 let descriptor = security_descriptor.as_mut_ptr().cast::<c_void>();
                 apply_absolute_security_descriptor(descriptor, sid, acl_heap.as_mut_ptr())?;
                 let acl = acl_heap.0;
+                let mut sacl = process_integrity_sacl()?;
+                if unsafe {
+                    windows_sys::Win32::Security::SetSecurityDescriptorSacl(
+                        descriptor,
+                        1,
+                        sacl.as_mut_ptr(),
+                        0,
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
                 let attributes = SECURITY_ATTRIBUTES {
                     nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                     lpSecurityDescriptor: descriptor,
@@ -752,6 +966,7 @@ mod windows {
                 Ok(Self {
                     security_descriptor,
                     acl,
+                    _sacl: sacl,
                     attributes,
                     _sid_storage: sid_storage,
                     _token: token,
@@ -787,6 +1002,84 @@ mod windows {
         }
 
         #[test]
+        fn default_pipe_connectivity_control() {
+            let name = format!(r"\\.\pipe\nexus-default-{}", std::process::id());
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let handle = unsafe {
+                CreateNamedPipeW(wide.as_ptr(), 3 | 0x40000000, 8, 2, 64, 64, 0, ptr::null())
+            };
+            assert_ne!(
+                handle,
+                INVALID_HANDLE_VALUE,
+                "create: {}",
+                io::Error::last_os_error()
+            );
+            let _server = Owned(handle);
+            let client = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    0xC0000000,
+                    0,
+                    ptr::null(),
+                    3,
+                    0x80,
+                    ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                client,
+                INVALID_HANDLE_VALUE,
+                "default client: {}",
+                io::Error::last_os_error()
+            );
+            drop(Owned(client));
+        }
+
+        #[test]
+        fn unexpected_dacl_trustee_is_rejected() {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Security::{CreateWellKnownSid, WinWorldSid};
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let _entered = runtime.enter();
+            let name = format!(r"\\.\pipe\nexus-reject-trustee-{}", std::process::id());
+            let server = create_user_only_pipe(&name, true).expect("secure create");
+            let mut world = [0u32; 17];
+            let mut size = std::mem::size_of_val(&world) as u32;
+            assert_ne!(
+                unsafe {
+                    CreateWellKnownSid(
+                        WinWorldSid,
+                        ptr::null_mut(),
+                        world.as_mut_ptr().cast(),
+                        &mut size,
+                    )
+                },
+                0
+            );
+            // Fault injection on an empty, test-only pipe: an accidental broad
+            // trustee must never satisfy the production descriptor validator.
+            let mut bad_acl = user_only_acl(world.as_mut_ptr().cast()).expect("bad fixture ACL");
+            let status = unsafe {
+                SetSecurityInfo(
+                    server.as_raw_handle() as HANDLE,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    bad_acl.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, ERROR_SUCCESS);
+            assert!(
+                assert_pipe_dacl_is_current_user_only(server.as_raw_handle() as isize).is_err()
+            );
+        }
+
+        #[test]
         fn pipe_dacl_is_the_current_user_only() {
             let name = format!(r"\\.\pipe\nexus-ephemera-dacl-{}", std::process::id());
             let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -812,6 +1105,7 @@ mod windows {
             // unit test share the same owner, group, and DACL shape.
             lock_pipe_to_current_user(handle.0 as isize).expect("owner dacl");
             let _sec = sec;
+            assert_pipe_integrity_matches_process(handle.0).expect("same integrity label");
             let client = unsafe {
                 CreateFileW(
                     wide.as_ptr(),
@@ -827,8 +1121,9 @@ mod windows {
                 panic!("client open: {}", io::Error::last_os_error());
             }
             drop(Owned(client));
-            // The next instance asks only for duplex access. WRITE_DAC is denied
-            // against this DACL and is not required to keep the pipe name.
+            // The next instance asks only for duplex access. The ACE still
+            // grants WRITE_DAC and WRITE_OWNER because the first instance's
+            // open mode includes those bits.
             let second = unsafe {
                 CreateNamedPipeW(wide.as_ptr(), 3 | 0x4000_0000, 8, 2, 64, 64, 0, ptr::null())
             };
@@ -849,5 +1144,6 @@ mod windows {
 #[cfg(windows)]
 pub use windows::{
     PipePeer, StdinPoll, assert_pipe_dacl_is_current_user_only, cancel_thread_id,
-    current_thread_id, lock_pipe_to_current_user, pipe_peer, pipe_server_peer, poll_stdin_read,
+    create_user_only_pipe, current_thread_id, lock_pipe_to_current_user, pipe_peer,
+    pipe_server_peer, poll_stdin_read,
 };

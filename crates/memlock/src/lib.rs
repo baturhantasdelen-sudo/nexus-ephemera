@@ -298,7 +298,17 @@ impl LockedBuffer {
             .unwrap_or(start)
             .min(self.backing.len());
         if start < end {
+            // `zeroize` plus a volatile store resists dead-store elimination.
+            // It does not clear registers, caches, or a core dump. `mlock`
+            // only keeps this span out of swap.
             self.backing[start..end].zeroize();
+            for byte in &mut self.backing[start..end] {
+                unsafe {
+                    std::ptr::write_volatile(byte, 0);
+                }
+            }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            std::hint::black_box(self.backing[start..end].as_ptr());
         }
     }
 

@@ -11,7 +11,9 @@
 //! file is held for the daemon's lifetime and is not unlinked on exit. A live
 //! listener is left in place.
 //! Windows pipes reject remote clients. Before the first accept, the
-//! pipe DACL is one allow ACE for the current user and that user is the owner.
+//! pipe DACL admits the current user, plus its exact package SID when the
+//! daemon runs in an AppContainer. The user remains the owner; the mandatory
+//! label matches the process integrity level. No broad package group is granted.
 //! Later instances keep that descriptor and are created before the previous
 //! handle is closed. The client checks the server process SID before it
 //! writes. This boundary is not mTLS and it does not stop a privileged
@@ -35,19 +37,31 @@ pub const DEFAULT_UNIX_SOCK: &str = "/var/run/nexus-ephemera.sock";
 pub const DEFAULT_WINDOWS_PIPE: &str = r"\\.\pipe\nexus-ephemera";
 const HARD_PAYLOAD_CAP: usize = 64 * 1024;
 const HARD_SECRET_CAP: usize = 4 * 1024;
+/// Endpoint strings copied into the idempotency cache.
+pub const ENDPOINT_MAX: usize = 2048;
+/// Payload hash strings copied into the idempotency cache.
+pub const PAYLOAD_HASH_MAX: usize = 128;
+/// Accepts charged to a UID/SID principal, not to a PID.
+const PRINCIPAL_ACCEPTS_PER_SEC: u32 = 64;
 
 #[derive(Debug)]
 pub enum IpcError {
     Io(std::io::Error),
     IdentityRejected,
     IdentityUnavailable,
-    PayloadTooLarge { limit: usize },
+    PayloadTooLarge {
+        limit: usize,
+    },
     TimedOut,
     TargetDenied,
     Malformed,
     CleanupIncomplete(TransactionReceipt),
     IdempotencyConflict,
     IdempotencyUnavailable,
+    /// Provider outcome is unknown. A non-expiring process-local tombstone
+    /// prevents redispatch of the same key until explicit reconciliation.
+    Inconclusive,
+    RateLimited,
     Broker(BrokerError),
     Protocol(&'static str),
 }
@@ -71,6 +85,8 @@ impl std::fmt::Display for IpcError {
                 write!(f, "ipc: idempotency key was reused for a different call")
             }
             Self::IdempotencyUnavailable => write!(f, "ipc: idempotency cache is full"),
+            Self::Inconclusive => write!(f, "ipc: provider outcome is inconclusive"),
+            Self::RateLimited => write!(f, "ipc: principal rate limit"),
             Self::Broker(BrokerError::Memlock(msg)) => write!(f, "ipc: {msg}"),
             Self::Broker(_) => write!(f, "ipc: broker rejected the call"),
             Self::Protocol(msg) => write!(f, "ipc: {msg}"),
@@ -84,6 +100,9 @@ impl From<std::io::Error> for IpcError {
     }
 }
 
+/// Authorization is the service-account UID (or the Windows user SID).
+/// The PID only proves the peer process is still alive. It is not a tenant
+/// name, and accept rate limits are charged to the UID, not the PID.
 pub fn peer_is_authorized(
     peer_uid: u32,
     peer_pid: Option<u32>,
@@ -115,6 +134,7 @@ pub fn client_outcome(
         }
         Ok(receipt) => Ok(receipt),
         Err(BrokerError::CleanupIncomplete(receipt)) => Err(IpcError::CleanupIncomplete(receipt)),
+        Err(BrokerError::Inconclusive) => Err(IpcError::Inconclusive),
         Err(err) => Err(IpcError::Broker(err)),
     }
 }
@@ -130,6 +150,8 @@ pub fn per_connection(err: &IpcError) -> bool {
         | IpcError::CleanupIncomplete(_)
         | IpcError::IdempotencyConflict
         | IpcError::IdempotencyUnavailable
+        | IpcError::Inconclusive
+        | IpcError::RateLimited
         | IpcError::Broker(_) => true,
         IpcError::Io(err) => matches!(
             err.kind(),
@@ -206,7 +228,9 @@ pub enum ServedCall {
 
 pub struct BrokerDaemon<T> {
     agent: SecureTransactionAgent,
-    transport: T,
+    transport: Option<T>,
+    dispatch_inbox: Option<std::sync::mpsc::Receiver<(T, Result<TransportReply, BrokerError>)>>,
+    principal_hits: std::collections::HashMap<u32, std::collections::VecDeque<std::time::Instant>>,
     allowlist: Vec<String>,
     max_payload_bytes: usize,
     timeout: Duration,
@@ -229,7 +253,7 @@ pub struct BrokerDaemon<T> {
     idempotency: crate::idempotency::IdempotencyCache,
 }
 
-impl<T: SecureTransport> BrokerDaemon<T> {
+impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
     /// Bind the listen socket or create the first named-pipe instance.
     ///
     /// Poll this on a Tokio runtime with IO enabled. `UnixListener::bind` panics
@@ -259,8 +283,6 @@ impl<T: SecureTransport> BrokerDaemon<T> {
         let (mut stream, peer_pid) = self.accept().await?;
         let result = self.handle_stream(&mut stream).await;
         let _ = stream.shutdown().await;
-        #[cfg(windows)]
-        self.reserve_next_pipe(stream)?;
         match result? {
             FrameBody::Call(receipt) => Ok(ServedCall::Call { peer_pid, receipt }),
             FrameBody::Metrics => Ok(ServedCall::Metrics { peer_pid }),
@@ -291,13 +313,7 @@ impl<T: SecureTransport> BrokerDaemon<T> {
             written?;
             return Ok(FrameBody::Metrics);
         }
-        let outcome = dispatch_call(
-            &request,
-            &self.allowlist,
-            &mut self.agent,
-            &mut self.transport,
-            &mut self.idempotency,
-        );
+        let outcome = self.dispatch_bounded(&request).await;
         if let Err(err) =
             write_response(stream, &outcome, self.max_payload_bytes, self.timeout).await
         {
@@ -325,55 +341,26 @@ impl<T: SecureTransport> BrokerDaemon<T> {
             .and_then(|pid| u32::try_from(pid).ok())
             .filter(|pid| *pid > 0);
         peer_is_authorized(peer_uid, peer_pid, self.daemon_uid).map_err(note_auth_failure)?;
+        self.charge_principal(peer_uid)?;
         let peer_pid = peer_pid.ok_or(IpcError::IdentityUnavailable)?;
         Ok((stream, peer_pid))
     }
 
     #[cfg(windows)]
     fn open_pipe(&mut self) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, IpcError> {
-        use std::os::windows::io::AsRawHandle;
-        let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
-        options.reject_remote_clients(true);
-        if self.first_instance {
-            options.first_pipe_instance(true);
-            // Only the first instance can request WRITE_DAC. Later instances
-            // are checked against the DACL this call installs.
-            options.write_dac(true);
-            options.write_owner(true);
-        }
-        let server = options.create(self.pipe_name.as_str())?;
-        if self.first_instance {
-            let handle = server.as_raw_handle() as isize;
-            // Same owner, group, and single-user DACL shape as
-            // `PipeSecurityAttributes::for_current_user` on create.
-            nexus_ephemera_ipc_os::lock_pipe_to_current_user(handle)?;
-            nexus_ephemera_ipc_os::assert_pipe_dacl_is_current_user_only(handle)
-                .map_err(IpcError::from)?;
-        }
+        let server =
+            nexus_ephemera_ipc_os::create_user_only_pipe(&self.pipe_name, self.first_instance)?;
         self.first_instance = false;
         Ok(server)
     }
 
-    /// Create the next instance before `current` is dropped, so the pipe name
-    /// is not free for another process to claim between requests.
+    /// The pending listener remains owned by self across every await. Reserve
+    /// its successor before exposing the connected handle to cancellable I/O.
     #[cfg(windows)]
-    fn reserve_next_pipe(
-        &mut self,
-        current: tokio::net::windows::named_pipe::NamedPipeServer,
-    ) -> Result<(), IpcError> {
-        match self.open_pipe() {
-            Ok(next) => {
-                drop(current);
-                self.pending = Some(next);
-                Ok(())
-            }
-            Err(err) => {
-                // The connected instance still owns the name. Keep it if the
-                // next create is denied, then fail closed.
-                self.pending = Some(current);
-                Err(err)
-            }
-        }
+    fn reserve_next_pipe(&mut self) -> Result<(), IpcError> {
+        let next = self.open_pipe()?;
+        self.pending = Some(next);
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -381,42 +368,78 @@ impl<T: SecureTransport> BrokerDaemon<T> {
         &mut self,
     ) -> Result<(tokio::net::windows::named_pipe::NamedPipeServer, u32), IpcError> {
         use std::os::windows::io::AsRawHandle;
-        let server = match self.pending.take() {
-            Some(server) => server,
-            None => self.open_pipe()?,
-        };
-        if let Err(err) = server.connect().await {
-            self.reserve_next_pipe(server)?;
-            return Err(err.into());
+        if self.pending.is_none() {
+            self.pending = Some(self.open_pipe()?);
         }
-        let peer = match nexus_ephemera_ipc_os::pipe_peer(server.as_raw_handle() as isize) {
-            Ok(peer) => peer,
-            Err(_) => {
-                self.reserve_next_pipe(server)?;
-                return Err(note_auth_failure(IpcError::IdentityUnavailable));
-            }
-        };
+        let connected = self
+            .pending
+            .as_ref()
+            .ok_or(IpcError::Protocol("missing pipe listener"))?
+            .connect()
+            .await;
+        let server = self
+            .pending
+            .take()
+            .ok_or(IpcError::Protocol("missing connected pipe"))?;
+        if let Err(err) = self.reserve_next_pipe() {
+            // No await occurred since take: even cancellation cannot lose the
+            // last instance. Keep the old handle if creating a successor fails.
+            self.pending = Some(server);
+            return Err(err);
+        }
+        connected?;
+        let peer = nexus_ephemera_ipc_os::pipe_peer(server.as_raw_handle() as isize)
+            .map_err(|_| note_auth_failure(IpcError::IdentityUnavailable))?;
         if peer.pid == 0 || !peer.same_user {
-            let err = if peer.pid == 0 {
+            return Err(note_auth_failure(if peer.pid == 0 {
                 IpcError::IdentityUnavailable
             } else {
                 IpcError::IdentityRejected
-            };
-            self.reserve_next_pipe(server)?;
-            return Err(note_auth_failure(err));
+            }));
         }
+        // Only authenticated current-user peers reach this SID-principal bucket.
+        // The successor is already retained for auth/rate-limit/error returns.
+        self.charge_principal(0)?;
         Ok((server, peer.pid))
+    }
+
+    fn charge_principal(&mut self, principal: u32) -> Result<(), IpcError> {
+        let now = std::time::Instant::now();
+        let entry = self.principal_hits.entry(principal).or_default();
+        while entry
+            .front()
+            .is_some_and(|instant| now.duration_since(*instant) >= Duration::from_secs(1))
+        {
+            entry.pop_front();
+        }
+        if entry.len() >= PRINCIPAL_ACCEPTS_PER_SEC as usize {
+            return Err(IpcError::RateLimited);
+        }
+        entry.push_back(now);
+        Ok(())
+    }
+
+    fn reap_provider(&mut self) {
+        let Some(inbox) = self.dispatch_inbox.take() else {
+            return;
+        };
+        match inbox.try_recv() {
+            Ok((transport, _)) => self.transport = Some(transport),
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.dispatch_inbox = Some(inbox),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
     }
 }
 
 #[cfg(unix)]
-fn listen<T>(
+fn listen<T: SecureTransport + Send + 'static>(
     config: DaemonConfig,
     agent: SecureTransactionAgent,
     transport: T,
 ) -> Result<BrokerDaemon<T>, IpcError> {
     use std::os::unix::fs::PermissionsExt;
     let path = std::path::PathBuf::from(&config.listen);
+    require_owner_only_parent(&path)?;
     let mut listen_lock = match nexus_ephemera_ipc_os::ListenLock::acquire(&lock_path_for(&path)) {
         Ok(lock) => lock,
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
@@ -458,7 +481,9 @@ fn listen<T>(
     let daemon_uid = nexus_ephemera_ipc_os::current_uid()?;
     Ok(BrokerDaemon {
         agent,
-        transport,
+        transport: Some(transport),
+        dispatch_inbox: None,
+        principal_hits: std::collections::HashMap::new(),
         allowlist: config.allowlist,
         max_payload_bytes: config.max_payload_bytes,
         timeout: config.timeout,
@@ -472,6 +497,26 @@ fn listen<T>(
             crate::idempotency::CACHE_CAP,
         ),
     })
+}
+
+#[cfg(unix)]
+fn require_owner_only_parent(path: &std::path::Path) -> Result<(), IpcError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let meta = std::fs::metadata(parent)?;
+    if !meta.is_dir() {
+        return Err(IpcError::Protocol("listen parent is not a directory"));
+    }
+    let uid = nexus_ephemera_ipc_os::current_uid()?;
+    if meta.uid() != uid || meta.permissions().mode() & 0o777 != 0o700 {
+        return Err(IpcError::Protocol(
+            "listen parent must be mode 0700 and owned by the service account",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -529,7 +574,7 @@ fn reclaim_unlocked_socket(path: &std::path::Path) -> Result<(), IpcError> {
 }
 
 #[cfg(windows)]
-fn listen<T: SecureTransport>(
+fn listen<T: SecureTransport + Send + 'static>(
     config: DaemonConfig,
     agent: SecureTransactionAgent,
     transport: T,
@@ -541,7 +586,9 @@ fn listen<T: SecureTransport>(
     }
     let mut daemon = BrokerDaemon {
         agent,
-        transport,
+        transport: Some(transport),
+        dispatch_inbox: None,
+        principal_hits: std::collections::HashMap::new(),
         allowlist: config.allowlist,
         max_payload_bytes: config.max_payload_bytes,
         timeout: config.timeout,
@@ -585,57 +632,191 @@ fn note_auth_failure(err: IpcError) -> IpcError {
     err
 }
 
-fn dispatch_call<T: SecureTransport>(
-    request: &WireRequest,
-    allowlist: &[String],
-    agent: &mut SecureTransactionAgent,
-    transport: &mut T,
-    cache: &mut crate::idempotency::IdempotencyCache,
-) -> Result<TransactionReceipt, IpcError> {
-    use crate::idempotency::{CachedBody, Lookup};
-    if request.endpoint.is_empty()
-        || request.payload_hash.is_empty()
-        || !crate::idempotency::valid_key(&request.idempotency_key)
-    {
-        return Err(IpcError::Malformed);
-    }
-    if !allowlist.iter().any(|item| item == &request.endpoint) {
-        return Err(IpcError::TargetDenied);
-    }
-    match cache.lookup(
-        &request.idempotency_key,
-        &request.endpoint,
-        &request.payload_hash,
-    ) {
-        Lookup::Replay(outcome) => outcome,
-        Lookup::Conflict => Err(IpcError::IdempotencyConflict),
-        Lookup::Full => Err(IpcError::IdempotencyUnavailable),
-        Lookup::Miss => {
-            let started = std::time::Instant::now();
-            let command = ExecuteWithPolicy {
-                context_id: agent.context_id(),
-                target_endpoint: request.endpoint.clone(),
-                payload_hash: request.payload_hash.clone(),
-                idempotency_key: request.idempotency_key.clone(),
-            };
-            let outcome = client_outcome(agent.execute(command, transport));
-            if let Some(body) = CachedBody::from_outcome(&outcome) {
-                let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                crate::metrics::record_dispatch_latency_us(micros);
-                crate::metrics::record_terminal_outcome(matches!(
-                    &outcome,
-                    Err(IpcError::CleanupIncomplete(_))
-                ));
-                cache.commit(
-                    &request.idempotency_key,
-                    &request.endpoint,
-                    &request.payload_hash,
-                    body,
-                );
+impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
+    async fn dispatch_bounded(
+        &mut self,
+        request: &WireRequest,
+    ) -> Result<TransactionReceipt, IpcError> {
+        use crate::idempotency::Lookup;
+        self.reap_provider();
+        if request.endpoint.is_empty()
+            || request.payload_hash.is_empty()
+            || request.endpoint.len() > ENDPOINT_MAX
+            || request.payload_hash.len() > PAYLOAD_HASH_MAX
+            || !crate::idempotency::valid_key(&request.idempotency_key)
+        {
+            return Err(
+                if request.endpoint.len() > ENDPOINT_MAX
+                    || request.payload_hash.len() > PAYLOAD_HASH_MAX
+                {
+                    IpcError::PayloadTooLarge {
+                        limit: ENDPOINT_MAX,
+                    }
+                } else {
+                    IpcError::Malformed
+                },
+            );
+        }
+        if !self.allowlist.iter().any(|item| item == &request.endpoint) {
+            return Err(IpcError::TargetDenied);
+        }
+        match self.idempotency.lookup(
+            &request.idempotency_key,
+            &request.endpoint,
+            &request.payload_hash,
+        ) {
+            Lookup::Replay(outcome) => outcome,
+            Lookup::Conflict => Err(IpcError::IdempotencyConflict),
+            Lookup::Full => Err(IpcError::IdempotencyUnavailable),
+            Lookup::Miss if self.dispatch_inbox.is_some() || self.transport.is_none() => {
+                Err(IpcError::Inconclusive)
             }
-            outcome
+            Lookup::Miss => self.provider_call(request).await,
         }
     }
+
+    async fn provider_call(
+        &mut self,
+        request: &WireRequest,
+    ) -> Result<TransactionReceipt, IpcError> {
+        let started = std::time::Instant::now();
+        let command = ExecuteWithPolicy {
+            context_id: self.agent.context_id(),
+            target_endpoint: request.endpoint.clone(),
+            payload_hash: request.payload_hash.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+        };
+        let pending = self
+            .agent
+            .begin_dispatch(command)
+            .map_err(client_outcome_err)?;
+        // Reserve before any external side effect. Unknown outcomes are not
+        // success receipts and must never silently age into a second dispatch.
+        self.idempotency.commit(
+            &request.idempotency_key,
+            &request.endpoint,
+            &request.payload_hash,
+            crate::idempotency::CachedBody::Pending,
+        );
+        let mut transport = self.transport.take().ok_or(IpcError::Inconclusive)?;
+        let call = OwnedProviderCall {
+            target_endpoint: pending.command.target_endpoint.clone(),
+            payload_hash: pending.command.payload_hash.clone(),
+            binding_digest_hex: pending.digest.clone(),
+            call_nonce: pending.nonce,
+            issued_at_unix_ms: pending.issued_at_unix_ms,
+            idempotency_key: pending.command.idempotency_key.clone(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("nexus-provider".into())
+            .spawn(move || {
+                let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    transport.dispatch(&crate::broker::AuthorizedCall {
+                        target_endpoint: &call.target_endpoint,
+                        payload_hash: &call.payload_hash,
+                        binding_digest_hex: &call.binding_digest_hex,
+                        call_nonce: call.call_nonce,
+                        issued_at_unix_ms: call.issued_at_unix_ms,
+                        idempotency_key: &call.idempotency_key,
+                    })
+                }));
+                let reply = match reply {
+                    Ok(reply) => reply,
+                    Err(_) => Err(BrokerError::Inconclusive),
+                };
+                let _ = tx.send((transport, reply));
+            });
+        if spawned.is_err() {
+            let outcome = client_outcome(
+                self.agent
+                    .end_dispatch(pending, Err(BrokerError::Inconclusive)),
+            );
+            self.record_outcome(request, &outcome, started);
+            return outcome;
+        }
+        let deadline = std::time::Instant::now() + self.timeout;
+        loop {
+            match rx.try_recv() {
+                Ok((transport, reply)) => {
+                    self.transport = Some(transport);
+                    let outcome = client_outcome(self.agent.end_dispatch(pending, reply));
+                    self.record_outcome(request, &outcome, started);
+                    return outcome;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(_) => {
+                    self.dispatch_inbox = Some(rx);
+                    let outcome = client_outcome(
+                        self.agent
+                            .end_dispatch(pending, Err(BrokerError::Inconclusive)),
+                    );
+                    self.record_outcome(request, &outcome, started);
+                    return outcome;
+                }
+            }
+        }
+    }
+
+    fn record_outcome(
+        &mut self,
+        request: &WireRequest,
+        outcome: &Result<TransactionReceipt, IpcError>,
+        started: std::time::Instant,
+    ) {
+        use crate::idempotency::CachedBody;
+        if matches!(
+            outcome,
+            Err(IpcError::Inconclusive | IpcError::TimedOut)
+                | Err(IpcError::Broker(
+                    BrokerError::Transport(_) | BrokerError::Inconclusive
+                ))
+        ) {
+            self.idempotency.commit(
+                &request.idempotency_key,
+                &request.endpoint,
+                &request.payload_hash,
+                CachedBody::Inconclusive,
+            );
+            crate::audit::note("inconclusive");
+            return;
+        }
+        if let Some(body) = CachedBody::from_outcome(outcome) {
+            let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            crate::metrics::record_dispatch_latency_us(micros);
+            crate::metrics::record_terminal_outcome(matches!(
+                outcome,
+                Err(IpcError::CleanupIncomplete(_))
+            ));
+            self.idempotency.commit(
+                &request.idempotency_key,
+                &request.endpoint,
+                &request.payload_hash,
+                body,
+            );
+            crate::audit::note("dispatch");
+        }
+    }
+}
+
+fn client_outcome_err(err: BrokerError) -> IpcError {
+    match client_outcome(Err(err)) {
+        Ok(_) => IpcError::Inconclusive,
+        Err(err) => err,
+    }
+}
+
+struct OwnedProviderCall {
+    target_endpoint: String,
+    payload_hash: String,
+    binding_digest_hex: String,
+    call_nonce: u64,
+    issued_at_unix_ms: u64,
+    idempotency_key: String,
 }
 
 async fn write_response<S>(
@@ -685,8 +866,19 @@ impl NexusClient {
         payload_hash: &str,
         idempotency_key: &str,
     ) -> Result<TransactionReceipt, IpcError> {
-        if !crate::idempotency::valid_key(idempotency_key) {
-            return Err(IpcError::Malformed);
+        if !crate::idempotency::valid_key(idempotency_key)
+            || endpoint.len() > ENDPOINT_MAX
+            || payload_hash.len() > PAYLOAD_HASH_MAX
+        {
+            return Err(
+                if endpoint.len() > ENDPOINT_MAX || payload_hash.len() > PAYLOAD_HASH_MAX {
+                    IpcError::PayloadTooLarge {
+                        limit: ENDPOINT_MAX,
+                    }
+                } else {
+                    IpcError::Malformed
+                },
+            );
         }
         let deadline = std::time::Instant::now() + self.timeout;
         let mut last = IpcError::TimedOut;
@@ -767,6 +959,13 @@ impl NexusClient {
             serde_json::from_slice(&response).map_err(|_| IpcError::Malformed)?;
         response.zeroize();
         let _ = stream.shutdown().await;
+        if parsed.kind != WireKind::Rejected
+            && (parsed.target_endpoint != endpoint
+                || parsed.payload_hash != payload_hash
+                || parsed.idempotency_key != idempotency_key)
+        {
+            return Err(IpcError::Malformed);
+        }
         parsed.into_result()
     }
 }
@@ -838,8 +1037,9 @@ async fn read_frame<S>(
 where
     S: AsyncRead + Unpin,
 {
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut len_buf = [0u8; 4];
-    tokio::time::timeout(timeout, stream.read_exact(&mut len_buf))
+    tokio::time::timeout_at(deadline, stream.read_exact(&mut len_buf))
         .await
         .map_err(|_| IpcError::TimedOut)??;
     let len = usize::try_from(u32::from_le_bytes(len_buf)).unwrap_or(usize::MAX);
@@ -847,7 +1047,7 @@ where
         return Err(IpcError::PayloadTooLarge { limit: max_payload });
     }
     let mut body = vec![0u8; len];
-    tokio::time::timeout(timeout, stream.read_exact(&mut body))
+    tokio::time::timeout_at(deadline, stream.read_exact(&mut body))
         .await
         .map_err(|_| IpcError::TimedOut)??;
     Ok(body)
@@ -867,12 +1067,13 @@ where
     }
     let len =
         u32::try_from(body.len()).map_err(|_| IpcError::PayloadTooLarge { limit: max_payload })?;
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut header = len.to_le_bytes();
-    tokio::time::timeout(timeout, stream.write_all(&header))
+    tokio::time::timeout_at(deadline, stream.write_all(&header))
         .await
         .map_err(|_| IpcError::TimedOut)??;
     header.zeroize();
-    tokio::time::timeout(timeout, stream.write_all(body))
+    tokio::time::timeout_at(deadline, stream.write_all(body))
         .await
         .map_err(|_| IpcError::TimedOut)??;
     Ok(())
@@ -1053,6 +1254,8 @@ fn code_name(err: &IpcError) -> &'static str {
         IpcError::CleanupIncomplete(_) => "cleanup_incomplete",
         IpcError::IdempotencyConflict => "idempotency_conflict",
         IpcError::IdempotencyUnavailable => "idempotency_unavailable",
+        IpcError::Inconclusive => "inconclusive",
+        IpcError::RateLimited => "rate_limited",
         _ => "rejected",
     }
 }
@@ -1068,7 +1271,37 @@ fn code_error(code: &str) -> IpcError {
         "cleanup_incomplete" => IpcError::Protocol("cleanup status missing receipt"),
         "idempotency_conflict" => IpcError::IdempotencyConflict,
         "idempotency_unavailable" => IpcError::IdempotencyUnavailable,
+        "inconclusive" => IpcError::Inconclusive,
+        "rate_limited" => IpcError::RateLimited,
         _ => IpcError::Protocol("request rejected"),
+    }
+}
+
+#[cfg(feature = "fuzz")]
+pub fn fuzz_wire_request(bytes: &[u8]) -> bool {
+    if bytes.len() > HARD_PAYLOAD_CAP {
+        return false;
+    }
+    serde_json::from_slice::<WireRequest>(bytes).is_ok_and(|r| match r.op {
+        WireOp::Metrics => {
+            r.endpoint.is_empty() && r.payload_hash.is_empty() && r.idempotency_key.is_empty()
+        }
+        WireOp::Call => {
+            !r.endpoint.is_empty()
+                && r.endpoint.len() <= ENDPOINT_MAX
+                && !r.payload_hash.is_empty()
+                && r.payload_hash.len() <= PAYLOAD_HASH_MAX
+                && crate::idempotency::valid_key(&r.idempotency_key)
+        }
+    })
+}
+
+#[cfg(feature = "fuzz")]
+pub fn fuzz_wire_response(bytes: &[u8]) {
+    if bytes.len() <= HARD_PAYLOAD_CAP
+        && let Ok(response) = serde_json::from_slice::<WireResponse>(bytes)
+    {
+        let _ = response.into_result();
     }
 }
 
@@ -1161,7 +1394,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn live_socket_is_not_unlinked() {
-        let dir = std::env::temp_dir();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nexus-ephemera-run-{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
         let path = dir.join(format!(
             "nexus-ephemera-live-{}-{}.sock",
             std::process::id(),
@@ -1251,5 +1487,69 @@ mod tests {
             seal_report,
             idempotency_key: "sample-key".into(),
         }
+    }
+}
+
+// Append this module to src/ipc.rs in an isolated audit checkout.
+// Regression: an uncertain external side effect must not dispatch twice.
+#[cfg(all(test, windows))]
+mod nine_point_audit {
+    use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn timeout_then_late_completion_does_not_repeat_the_same_key() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct SlowCount(Arc<AtomicUsize>);
+        impl SecureTransport for SlowCount {
+            fn dispatch(
+                &mut self,
+                _: &crate::broker::AuthorizedCall<'_>,
+            ) -> Result<TransportReply, BrokerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(TransportReply { status: 204 })
+            }
+        }
+        let _serial = crate::apoptosis::test_serial();
+        crate::apoptosis::reset_coordinator_for_tests();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let config = DaemonConfig {
+                listen: format!(r"\\.\pipe\nexus-audit-late-{}", uuid::Uuid::new_v4()),
+                allowlist: vec!["https://provider.example/charge".into()],
+                max_payload_bytes: 1024,
+                timeout: Duration::from_millis(5),
+                idempotency_ttl: Duration::from_secs(60),
+                single_use: false,
+            };
+            let mut secret = b"audit-only-key".to_vec();
+            let mut daemon = BrokerDaemon::bind(config, &mut secret, SlowCount(Arc::clone(&calls)))
+                .await
+                .expect("bind");
+            let request = WireRequest {
+                op: WireOp::Call,
+                endpoint: "https://provider.example/charge".into(),
+                payload_hash: "hash-a".into(),
+                idempotency_key: "same-request".into(),
+            };
+            assert!(matches!(
+                daemon.dispatch_bounded(&request).await,
+                Err(IpcError::Inconclusive)
+            ));
+            tokio::time::sleep(Duration::from_millis(160)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let _ = daemon.dispatch_bounded(&request).await;
+            tokio::time::sleep(Duration::from_millis(160)).await;
+            let observed = calls.load(Ordering::SeqCst);
+            eprintln!("audit_provider_dispatches_for_same_key={observed}");
+            assert_eq!(observed, 1, "uncertain side effect was dispatched twice");
+        });
     }
 }

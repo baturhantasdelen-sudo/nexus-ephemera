@@ -252,6 +252,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tokio",
  "uuid",
  "zeroize",
@@ -262,6 +263,7 @@ name = "nexus-ephemera-ipc-os"
 version = "0.2.0"
 dependencies = [
  "libc",
+ "tokio",
  "windows-sys 0.59.0",
 ]
 

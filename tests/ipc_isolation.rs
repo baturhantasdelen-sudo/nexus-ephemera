@@ -210,7 +210,7 @@ async fn stalled_and_oversized_frames_are_rejected_before_use() {
         let _ = stream.shutdown().await;
     });
     let started = Instant::now();
-    let err = daemon.serve_one().await.expect_err("stall");
+    let err = serve_bounded(&mut daemon).await.expect_err("stall");
     let elapsed = started.elapsed();
     assert!(matches!(err, IpcError::TimedOut));
     assert!(elapsed >= Duration::from_millis(150));
@@ -225,7 +225,7 @@ async fn stalled_and_oversized_frames_are_rejected_before_use() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let _ = stream.shutdown().await;
     });
-    let err = daemon.serve_one().await.expect_err("oversize");
+    let err = serve_bounded(&mut daemon).await.expect_err("oversize");
     assert!(
         matches!(err, IpcError::PayloadTooLarge { .. }),
         "oversize rejection was {err}"
@@ -239,7 +239,7 @@ async fn stalled_and_oversized_frames_are_rejected_before_use() {
             client.execute(PREFIX, "payload-hash", "stall-deny").await
         }
     });
-    let err = daemon.serve_one().await.expect_err("prefix");
+    let err = serve_bounded(&mut daemon).await.expect_err("prefix");
     assert!(matches!(err, IpcError::TargetDenied));
     assert!(matches!(denied.await.unwrap(), Err(IpcError::TargetDenied)));
 
@@ -250,7 +250,7 @@ async fn stalled_and_oversized_frames_are_rejected_before_use() {
             client.execute(ALLOWED, "payload-hash", "stall-allow").await
         }
     });
-    let served = daemon.serve_one().await.expect("allowed");
+    let served = serve_bounded(&mut daemon).await.expect("allowed");
     let nexus_ephemera::ipc::ServedCall::Call { peer_pid, receipt } = served else {
         panic!("expected a call result");
     };
@@ -286,7 +286,7 @@ async fn duplicate_idempotency_key_does_not_dispatch_again() {
                 .await
         }
     });
-    let first_served = daemon.serve_one().await.expect("first");
+    let first_served = serve_bounded(&mut daemon).await.expect("first");
     let first = first_task.await.unwrap().expect("first receipt");
     let nexus_ephemera::ipc::ServedCall::Call { receipt, .. } = first_served else {
         panic!("expected a call");
@@ -303,7 +303,7 @@ async fn duplicate_idempotency_key_does_not_dispatch_again() {
                 .await
         }
     });
-    let _ = daemon.serve_one().await.expect("replay");
+    let _ = serve_bounded(&mut daemon).await.expect("replay");
     let replay = replay_task.await.unwrap().expect("replay receipt");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(replay.binding_digest_hex, first.binding_digest_hex);
@@ -319,7 +319,7 @@ async fn duplicate_idempotency_key_does_not_dispatch_again() {
                 .await
         }
     });
-    let conflict = daemon.serve_one().await.expect_err("conflict");
+    let conflict = serve_bounded(&mut daemon).await.expect_err("conflict");
     assert!(matches!(conflict, IpcError::IdempotencyConflict));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let client_conflict = conflict_task.await.unwrap().expect_err("client conflict");
@@ -335,7 +335,7 @@ async fn duplicate_idempotency_key_does_not_dispatch_again() {
                 .await
         }
     });
-    let served = daemon.serve_one().await.expect("metrics");
+    let served = serve_bounded(&mut daemon).await.expect("metrics");
     assert!(matches!(
         served,
         nexus_ephemera::ipc::ServedCall::Metrics { .. }
@@ -348,6 +348,62 @@ async fn duplicate_idempotency_key_does_not_dispatch_again() {
     assert!(!text.contains("ipc-isolation-secret"));
     assert!(!text.contains(&first.binding_digest_hex));
     assert!(snapshot.cleanup_incomplete_rate <= 1000);
+}
+
+// Bound accept as well as frame I/O. If a client cannot connect, a test must
+// fail with context instead of waiting forever or blocking the global test gate.
+async fn serve_bounded<T: SecureTransport + Send + 'static>(
+    daemon: &mut BrokerDaemon<T>,
+) -> Result<nexus_ephemera::ipc::ServedCall, IpcError> {
+    tokio::time::timeout(Duration::from_secs(10), daemon.serve_one())
+        .await
+        .expect("server accept/serve exceeded 10s; inspect the client connection result")
+}
+
+#[tokio::test]
+async fn cancelled_accept_and_frame_read_preserve_listener() {
+    let _guard = GATE.lock().await;
+    let listen = unique_listen();
+    let mut secret = SECRET.to_vec();
+    let mut daemon = BrokerDaemon::bind(
+        test_config(&listen, 2_000),
+        &mut secret,
+        LocalAcceptTransport,
+    )
+    .await
+    .expect("bind");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), daemon.serve_one())
+            .await
+            .is_err()
+    );
+    let mut stalled = open_raw(&listen).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), daemon.serve_one())
+            .await
+            .is_err()
+    );
+    let _ = stalled.shutdown().await;
+    drop(stalled);
+    let client = tokio::spawn({
+        let listen = listen.clone();
+        async move {
+            NexusClient::new(listen, Duration::from_secs(3), 1024)
+                .expect("client")
+                .execute(ALLOWED, "hash", "after-cancel")
+                .await
+        }
+    });
+    serve_bounded(&mut daemon)
+        .await
+        .expect("listener survived cancellation");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client deadline")
+            .expect("join")
+            .is_ok()
+    );
 }
 
 struct CountingTransport {
@@ -399,8 +455,11 @@ fn unique_listen() -> String {
     let pid = std::process::id();
     #[cfg(unix)]
     {
-        std::env::temp_dir()
-            .join(format!("nexus-ephemera-{pid}-{n}.sock"))
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nexus-ephemera-run-{pid}"));
+        let _ = std::fs::create_dir(&dir);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        dir.join(format!("nexus-ephemera-{pid}-{n}.sock"))
             .to_string_lossy()
             .into_owned()
     }

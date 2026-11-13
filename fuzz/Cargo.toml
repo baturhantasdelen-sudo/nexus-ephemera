@@ -1,0 +1,17 @@
+[package]
+name = "nexus-ephemera-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+[package.metadata]
+cargo-fuzz = true
+[workspace]
+[dependencies]
+libfuzzer-sys = "0.4"
+nexus-ephemera = { path = "..", features = ["fuzz"] }
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false

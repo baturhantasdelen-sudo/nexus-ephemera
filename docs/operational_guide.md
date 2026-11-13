@@ -34,7 +34,7 @@ The daemon zeroizes its own copy after admission. The file you redirected stays 
 
 On Linux the socket is created mode `0600`. The daemon holds `<socket>.lock` for its lifetime and records its PID there. Shutdown releases the flock only; the lock file stays on disk so another process cannot lose its lock during teardown. An existing socket is removed only when that lock is free and connect is refused. Drop deletes the socket only when its device and inode are still the ones this process bound. A connect that succeeds means a live listener: the file is left in place and the new process exits. The probe sends no frame. The client checks the server UID, a non-zero server PID, and mode `0600` before it writes.
 
-On Windows the pipe rejects remote clients. Before the first accept, the pipe DACL is replaced with one allow ACE for the current user. That ACE is `GENERIC_READ | GENERIC_WRITE` mapped to the pipe's specific rights, plus the right to create the next duplex instance. The user is the owner. Later instances are opened without `WRITE_DAC` and are created before the previous handle is closed. The client checks the server process SID before it writes. A privileged administrator is outside this check. This is not mTLS.
+On Windows the pipe rejects remote clients. The pipe is created with an explicit current-user DACL and a mandatory label matching the daemon process. In an AppContainer, only its exact package SID is added to satisfy the second access check; broad package groups are never granted access. The current user is the owner. Subsequent instances are opened without requesting `WRITE_DAC`/`WRITE_OWNER`. A successor instance is reserved before connected I/O, so cancellation, authentication errors and rate-limit returns retain the pipe name. Medium/high services are not relabeled low to admit lower-integrity clients. The client checks the server process SID before it writes. A privileged administrator is outside this check. This is not mTLS.
 
 ## Lock quota
 
@@ -79,7 +79,7 @@ prlimit --pid <daemon-pid> --memlock
 
 `--timeout-ms` bounds each IPC read and each IPC write on one accepted connection. The default is 5000 ms. The allowed range is 1 ms through 120 s. A peer that connects and sends nothing is dropped with a timeout. A frame longer than `--max-payload` (hard cap 64 KiB) is rejected before the body is allocated.
 
-The daemon serves one connection at a time. `SecureTransport::dispatch` runs on that same thread and is synchronous. The IPC timeout does not cancel a dispatch that has already started. The built-in transport returns a local status and does not open a provider socket. A deployment that calls a provider must enforce its own deadline inside `dispatch`. If that call blocks, the daemon accepts no later IPC client until `dispatch` returns. Those clients wait on connect, or their own read timeout fires. That is fail-closed on the next caller. It is not an abort of the provider call already in progress.
+The daemon serves one IPC connection at a time. Provider dispatch runs on one isolated worker thread without holding a wipe permit. A deadline returns Inconclusive, not proof of cancellation. The worker may still finish an external side effect. While it is occupied, fresh dispatches are refused. An uncertain key retains a non-expiring, process-local tombstone; retries cannot dispatch it again. Late completion restores transport availability but does not turn the uncertain receipt into success. Providers must enforce their own I/O deadline. A permanently blocked worker requires operational intervention; Rust cannot safely kill it.
 
 After `dispatch` returns, the outcome is stored under the idempotency key. A client that retries because its own timeout fired is served from that cache when the first attempt has finished. The retry does not call `dispatch` again.
 
@@ -92,10 +92,11 @@ Every call frame carries an `idempotency_key`. The daemon accepts an opaque ASCI
 | New key | `dispatch` runs once. A receipt, `CleanupIncomplete`, or a transport error is cached until the TTL. |
 | Same key, same endpoint, same payload hash | The cached outcome is returned. `dispatch` is not called. |
 | Same key, different endpoint or payload hash | Conflict. `dispatch` is not called. |
-| Key older than `--idempotency-ttl-ms` | The entry is gone. The next request is a new call. Default TTL is 15 minutes. The range is 1 ms through 24 h. |
+| Completed key older than `--idempotency-ttl-ms` | The entry is gone. The next request is a new call. Default TTL is 15 minutes. The range is 1 ms through 24 h. |
+| Unknown provider outcome | A non-expiring reservation returns Inconclusive; it is never a success receipt and never automatically permits another dispatch. |
 | Cache already holds 256 live keys | A new key is refused before `dispatch`. Live keys are not evicted to make room. |
 
-The cache is process memory. It is not written to disk and it does not survive a restart. A restart can dispatch a key that the previous process already sent. The key is not mixed into the binding digest, and it is not proof of who the caller is. Caller identity remains the Unix UID and PID, or the Windows user SID.
+The cache is process memory. It is not written to disk and it does not survive a restart. A restart can dispatch a key that the previous process already sent. The key is not mixed into the binding digest, and it is not proof of who the caller is. Caller authorization is the Unix UID or Windows user SID; a PID is not a tenant identity.
 
 `CleanupIncomplete` is cached because the provider call already happened and the seal did not finish cleanly. Replaying it as `Ok` would hide that. A transport error is cached for the same at-most-once reason: the daemon cannot know whether the provider accepted the attempt.
 
@@ -108,7 +109,7 @@ Generate the idempotency key in the client, before the first attempt. A UUID v4 
 3. If the result is `CleanupIncomplete`, do not generate a new key. Do not change the endpoint or the payload hash. Do not treat the transport status as success. `Partial` and `Failed` seals stay errors on the retry.
 4. Retry with the same three values. The daemon returns the cached `CleanupIncomplete` and does not call the provider again.
 5. A different payload hash or endpoint under that same key is a conflict. The provider is still not called. Fix the caller so the retry matches the original attempt.
-6. After the TTL, or after the daemon process exits, the cache is empty. The same key can be dispatched again. That is a new provider attempt. Reconcile it outside this crate before retrying across a restart.
+6. Completed outcomes expire after the TTL. Inconclusive reservations do not expire and consume cache capacity (256 entries); exhaustion rejects new keys. Restart loses all process-local reservations. Reconcile with the provider before retrying across a restart. This is not durable exactly-once execution.
 
 The binding digest on the receipt is not the idempotency key and not a MAC. Do not log the digest next to the key if your policy forbids that pairing. The key itself is not a secret, but it is also not an authenticator. Caller identity remains the Unix UID and PID, or the Windows user SID.
 

@@ -13,11 +13,12 @@ jobs:
   validate:
     name: Build, Clippy, Format & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
 
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         rust: [stable]
 
     steps:
@@ -36,7 +37,7 @@ jobs:
       - name: Run Clippy lints (-D warnings)
         env:
           CARGO_INCREMENTAL: 0
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run release test suite (including Linux fork & memlock probes)
         if: runner.os != 'Linux'
