@@ -223,8 +223,6 @@ mod windows {
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACL_REVISION: u32 = 2;
 
-    const STANDARD_RIGHTS_REQUIRED: u32 = 0x000F_0000;
-
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn InitializeAcl(pacl: *mut ACL, n_acl_length: u32, dw_acl_revision: u32) -> i32;
@@ -322,7 +320,7 @@ mod windows {
             GenericAll: FILE_ALL_ACCESS,
         };
         unsafe { MapGenericMask(&mut mask, &mapping) };
-        mask | FILE_CREATE_PIPE_INSTANCE | STANDARD_RIGHTS_REQUIRED
+        mask | FILE_CREATE_PIPE_INSTANCE
     }
 
     struct HeapAcl(Vec<u8>);
@@ -450,6 +448,71 @@ mod windows {
 
     pub fn current_thread_id() -> u32 {
         unsafe { GetCurrentThreadId() }
+    }
+
+    /// Result of a single cooperative stdin poll (piped stdin uses `PeekNamedPipe`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StdinPoll {
+        Read(usize),
+        Eof,
+        Idle,
+        Cancelled,
+    }
+
+    /// Read available piped stdin bytes without blocking when the pipe is empty.
+    ///
+    /// Returns [`StdinPoll::Idle`] after a short sleep when no bytes are ready.
+    pub fn poll_stdin_read(
+        out: &mut [u8],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<StdinPoll> {
+        use std::io::Read;
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(StdinPoll::Cancelled);
+        }
+        if out.is_empty() {
+            return Ok(StdinPoll::Idle);
+        }
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut avail = 0u32;
+        let mut bytes_left = 0u32;
+        let peek_ok = unsafe {
+            PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut avail,
+                &mut bytes_left,
+            )
+        };
+        if peek_ok == 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(109) {
+                return Ok(StdinPoll::Eof);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            return Ok(StdinPoll::Idle);
+        }
+        if avail == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            return Ok(StdinPoll::Idle);
+        }
+        let to_read = out.len().min(usize::try_from(avail).unwrap_or(out.len()));
+        match std::io::stdin().lock().read(&mut out[..to_read]) {
+            Ok(0) => Ok(StdinPoll::Eof),
+            Ok(n) => Ok(StdinPoll::Read(n)),
+            Err(err) if err.raw_os_error() == Some(995) => Ok(StdinPoll::Cancelled),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(StdinPoll::Idle),
+            Err(err) => Err(err),
+        }
     }
 
     /// Cancel a blocked stdin `ReadFile` on `thread_id` so that thread can wipe and exit.
@@ -709,6 +772,6 @@ mod windows {
 
 #[cfg(windows)]
 pub use windows::{
-    PipePeer, cancel_thread_id, current_thread_id, lock_pipe_to_current_user, pipe_peer,
-    pipe_server_peer,
+    PipePeer, StdinPoll, cancel_thread_id, current_thread_id, lock_pipe_to_current_user, pipe_peer,
+    pipe_server_peer, poll_stdin_read,
 };

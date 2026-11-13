@@ -2,8 +2,6 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(windows)]
-use std::io::Read;
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -220,22 +218,16 @@ fn read_secret_unix(
 fn read_secret_windows(shutdown: &AtomicBool) -> Result<Vec<u8>, IpcError> {
     let mut buffer = Zeroizing::new(vec![0u8; STDIN_PROBE]);
     let mut filled = 0usize;
-    let mut stdin = std::io::stdin().lock();
     while filled < STDIN_PROBE {
-        if shutdown.load(Ordering::Relaxed) {
-            return Err(IpcError::Protocol(
-                "daemon secret was not closed within the timeout",
-            ));
-        }
-        match stdin.read(&mut buffer[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(err) if err.raw_os_error() == Some(995) => {
+        match nexus_ephemera_ipc_os::poll_stdin_read(&mut buffer[filled..], shutdown) {
+            Ok(nexus_ephemera_ipc_os::StdinPoll::Read(n)) => filled += n,
+            Ok(nexus_ephemera_ipc_os::StdinPoll::Eof) => break,
+            Ok(nexus_ephemera_ipc_os::StdinPoll::Idle) => continue,
+            Ok(nexus_ephemera_ipc_os::StdinPoll::Cancelled) => {
                 return Err(IpcError::Protocol(
                     "daemon secret was not closed within the timeout",
                 ));
             }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err.into()),
         }
     }
