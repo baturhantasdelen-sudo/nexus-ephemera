@@ -572,8 +572,13 @@ mod sys {
         // SAFETY: yalnızca bu sürecin memlock tavanını yükseltmeyi dener.
         let rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
         #[cfg(test)]
-        return rc == 0 || eperm_graceful_fallback();
-        rc == 0
+        {
+            return rc == 0 || eperm_graceful_fallback();
+        }
+        #[cfg(not(test))]
+        {
+            return rc == 0;
+        }
     }
 
     pub fn lock(ptr: *mut u8, len: usize) -> Result<(), SysLockError> {
