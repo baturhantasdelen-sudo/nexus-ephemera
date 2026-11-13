@@ -424,6 +424,7 @@ fn listen<T>(
             || err.kind() == std::io::ErrorKind::AddrInUse
             || err.raw_os_error() == Some(11) // EAGAIN / EWOULDBLOCK
             || err.raw_os_error() == Some(16) // EBUSY
+            || err.raw_os_error() == Some(98) // EADDRINUSE
             =>
         {
             return Err(IpcError::Protocol("listen socket is already in use"));
@@ -433,9 +434,8 @@ fn listen<T>(
     reclaim_unlocked_socket(&path)?;
     let listener = match tokio::net::UnixListener::bind(&path) {
         Ok(listener) => listener,
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse
-            || err.raw_os_error() == Some(98) // EADDRINUSE
-            =>
+        Err(err)
+            if err.kind() == std::io::ErrorKind::AddrInUse || err.raw_os_error() == Some(98) =>
         {
             return Err(IpcError::Protocol("listen socket is already in use"));
         }
