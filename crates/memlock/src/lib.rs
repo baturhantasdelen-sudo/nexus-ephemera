@@ -564,6 +564,7 @@ mod sys {
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
+    #[cfg(test)]
     pub fn prepare() -> bool {
         let limit = libc::rlimit {
             rlim_cur: 64 * 1024 * 1024,
@@ -571,14 +572,17 @@ mod sys {
         };
         // SAFETY: yalnızca bu sürecin memlock tavanını yükseltmeyi dener.
         let rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
-        #[cfg(test)]
-        {
-            rc == 0 || eperm_graceful_fallback()
-        }
-        #[cfg(not(test))]
-        {
-            rc == 0
-        }
+        rc == 0 || eperm_graceful_fallback()
+    }
+
+    #[cfg(not(test))]
+    pub fn prepare() -> bool {
+        let limit = libc::rlimit {
+            rlim_cur: 64 * 1024 * 1024,
+            rlim_max: 64 * 1024 * 1024,
+        };
+        // SAFETY: yalnızca bu sürecin memlock tavanını yükseltmeyi dener.
+        unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) == 0 }
     }
 
     pub fn lock(ptr: *mut u8, len: usize) -> Result<(), SysLockError> {

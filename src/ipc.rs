@@ -343,7 +343,12 @@ impl<T: SecureTransport> BrokerDaemon<T> {
         }
         let server = options.create(self.pipe_name.as_str())?;
         if self.first_instance {
-            nexus_ephemera_ipc_os::lock_pipe_to_current_user(server.as_raw_handle() as isize)?;
+            let handle = server.as_raw_handle() as isize;
+            // Same owner, group, and single-user DACL shape as
+            // `PipeSecurityAttributes::for_current_user` on create.
+            nexus_ephemera_ipc_os::lock_pipe_to_current_user(handle)?;
+            nexus_ephemera_ipc_os::assert_pipe_dacl_is_current_user_only(handle)
+                .map_err(IpcError::from)?;
         }
         self.first_instance = false;
         Ok(server)

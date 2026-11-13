@@ -27,15 +27,36 @@ pub struct ListenLock {
 #[cfg(unix)]
 impl ListenLock {
     pub fn acquire(path: &std::path::Path) -> io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "lock path contains NUL"))?;
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a new descriptor from `open`.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if file.metadata()?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "listen lock path is a symlink",
+            ));
+        }
+        if file.metadata()?.mode() & 0o777 != 0o600 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "listen lock path must be mode 0600",
+            ));
+        }
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
@@ -204,6 +225,17 @@ mod windows {
         OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
         PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReadFile(
+            h_file: HANDLE,
+            lp_buffer: *mut c_void,
+            n_number_of_bytes_to_read: u32,
+            lp_number_of_bytes_read: *mut u32,
+            lp_overlapped: *mut c_void,
+        ) -> i32;
+    }
     use windows_sys::Win32::System::Pipes::{
         GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
     };
@@ -280,6 +312,12 @@ mod windows {
     /// current process, not a static well-known SID. Remote clients are a
     /// separate `PIPE_REJECT_REMOTE_CLIENTS` flag on create. A privileged
     /// administrator can still open the process. This is not mTLS.
+    pub fn assert_pipe_dacl_is_current_user_only(handle: isize) -> io::Result<()> {
+        let handle = handle as HANDLE;
+        dacl_is_current_user_only(handle, SE_KERNEL_OBJECT)
+            .or_else(|_| dacl_is_current_user_only(handle, SE_FILE_OBJECT))
+    }
+
     pub fn lock_pipe_to_current_user(handle: isize) -> io::Result<()> {
         let (sid, user, token) = current_process_user_sid()?;
         let _keepalive = (user, token);
@@ -466,7 +504,6 @@ mod windows {
         out: &mut [u8],
         cancel: &std::sync::atomic::AtomicBool,
     ) -> io::Result<StdinPoll> {
-        use std::io::Read;
         use std::sync::atomic::Ordering;
         use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
         use windows_sys::Win32::System::Pipes::PeekNamedPipe;
@@ -495,24 +532,53 @@ mod windows {
         };
         if peek_ok == 0 {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(109) {
-                return Ok(StdinPoll::Eof);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            return Ok(StdinPoll::Idle);
+            return match err.raw_os_error() {
+                Some(109) => Ok(StdinPoll::Eof),
+                Some(87) | Some(6) => read_stdin_handle(handle, out, cancel),
+                _ => Err(err),
+            };
         }
         if avail == 0 {
             std::thread::sleep(std::time::Duration::from_millis(10));
             return Ok(StdinPoll::Idle);
         }
-        let to_read = out.len().min(usize::try_from(avail).unwrap_or(out.len()));
-        match std::io::stdin().lock().read(&mut out[..to_read]) {
-            Ok(0) => Ok(StdinPoll::Eof),
-            Ok(n) => Ok(StdinPoll::Read(n)),
-            Err(err) if err.raw_os_error() == Some(995) => Ok(StdinPoll::Cancelled),
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(StdinPoll::Idle),
-            Err(err) => Err(err),
+        let cap = usize::try_from(avail).unwrap_or(out.len()).min(out.len());
+        read_stdin_handle(handle, &mut out[..cap], cancel)
+    }
+
+    fn read_stdin_handle(
+        handle: HANDLE,
+        out: &mut [u8],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<StdinPoll> {
+        use std::sync::atomic::Ordering;
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(StdinPoll::Cancelled);
         }
+        let to_read = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                out.as_mut_ptr().cast(),
+                to_read,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(109) => Ok(StdinPoll::Eof),
+                Some(995) => Ok(StdinPoll::Cancelled),
+                Some(233) if read == 0 => Ok(StdinPoll::Idle),
+                _ => Err(err),
+            };
+        }
+        if read == 0 {
+            return Ok(StdinPoll::Eof);
+        }
+        Ok(StdinPoll::Read(usize::try_from(read).unwrap_or(0)))
     }
 
     /// Cancel a blocked stdin `ReadFile` on `thread_id` so that thread can wipe and exit.
@@ -655,21 +721,32 @@ mod windows {
             Ok(())
         }
 
+        /// Absolute security descriptor for the first named-pipe instance.
+        ///
+        /// The token user buffer keeps the owner SID pointer valid for the life
+        /// of this value.
         #[allow(dead_code)]
-        struct PipeSecurityAttributes {
-            security_descriptor: Vec<u8>,
-            acl: HeapAcl,
-            attributes: SECURITY_ATTRIBUTES,
+        pub struct PipeSecurityAttributes {
+            pub security_descriptor: Vec<u8>,
+            pub acl: Vec<u8>,
+            pub attributes: SECURITY_ATTRIBUTES,
+            _sid_storage: Vec<u64>,
+            _token: Owned,
         }
 
         impl PipeSecurityAttributes {
-            fn for_current_user() -> io::Result<Self> {
-                let (sid, user, token) = current_process_user_sid()?;
-                let _keepalive = (user, token);
-                let mut acl = user_only_acl(sid)?;
+            pub fn for_current_user() -> io::Result<Self> {
+                let token = open_token(unsafe { GetCurrentProcess() })?;
+                let sid_storage = token_user_bytes(token.0)?;
+                let sid = unsafe { (*sid_storage.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+                if sid.is_null() {
+                    return Err(io::Error::other("current user sid missing"));
+                }
+                let mut acl_heap = user_only_acl(sid)?;
                 let mut security_descriptor = vec![0u8; 128];
                 let descriptor = security_descriptor.as_mut_ptr().cast::<c_void>();
-                apply_absolute_security_descriptor(descriptor, sid, acl.as_mut_ptr())?;
+                apply_absolute_security_descriptor(descriptor, sid, acl_heap.as_mut_ptr())?;
+                let acl = acl_heap.0;
                 let attributes = SECURITY_ATTRIBUTES {
                     nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                     lpSecurityDescriptor: descriptor,
@@ -679,10 +756,12 @@ mod windows {
                     security_descriptor,
                     acl,
                     attributes,
+                    _sid_storage: sid_storage,
+                    _token: token,
                 })
             }
 
-            fn as_security_attributes(&self) -> *const SECURITY_ATTRIBUTES {
+            pub fn as_security_attributes(&self) -> *const SECURITY_ATTRIBUTES {
                 std::ptr::from_ref(&self.attributes)
             }
         }
@@ -772,6 +851,6 @@ mod windows {
 
 #[cfg(windows)]
 pub use windows::{
-    PipePeer, StdinPoll, cancel_thread_id, current_thread_id, lock_pipe_to_current_user, pipe_peer,
-    pipe_server_peer, poll_stdin_read,
+    PipePeer, StdinPoll, assert_pipe_dacl_is_current_user_only, cancel_thread_id,
+    current_thread_id, lock_pipe_to_current_user, pipe_peer, pipe_server_peer, poll_stdin_read,
 };
