@@ -17,9 +17,22 @@ else:
     import os
     import socket
     import stat
+    from typing import Protocol, cast
 
     from .errors import TimedOut, io_failure
-    from .identity import assess_peer, require_private_unix_socket, unpack_ucred
+    from .identity import (
+        assess_peer,
+        peer_socket_ready,
+        require_private_unix_socket,
+        unpack_ucred,
+    )
+
+    class _PeerSocket(Protocol):
+        """``socket.socket`` or asyncio's ``TransportSocket`` wrapper."""
+
+        def fileno(self) -> int: ...
+
+        def getsockopt(self, level: int, optname: int, buflen: int) -> bytes: ...
 
     class _UnixStream:
         def __init__(
@@ -59,7 +72,7 @@ else:
             is_socket=stat.S_ISSOCK(info.st_mode),
         )
 
-    def _check_peer(sock: socket.socket) -> None:
+    def _check_peer(sock: _PeerSocket) -> None:
         if sys.platform == "linux":
             try:
                 raw = sock.getsockopt(socket.SOL_SOCKET, 17, 12)
@@ -73,7 +86,7 @@ else:
             return
         raise IdentityUnavailable("ipc: caller identity unavailable")
 
-    def _check_darwin_peer(sock: socket.socket) -> None:
+    def _check_darwin_peer(sock: _PeerSocket) -> None:
         import ctypes
 
         libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
@@ -111,9 +124,8 @@ else:
         verified = False
         try:
             sock = writer.get_extra_info("socket")
-            if not isinstance(sock, socket.socket):
-                raise IdentityUnavailable("ipc: caller identity unavailable")
-            _check_peer(sock)
+            peer_socket_ready(sock)
+            _check_peer(cast(_PeerSocket, sock))
             verified = True
             return _UnixStream(reader, writer)
         finally:

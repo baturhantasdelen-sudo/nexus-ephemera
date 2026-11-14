@@ -19,3 +19,5 @@ cargo test --workspace --release
 ```
 
 On Linux, the test shell must be able to raise `RLIMIT_MEMLOCK` before `cargo test`. The daemon reads its key from stdin, not from argv.
+
+Remediation lifecycle guarantees and release/deployment acceptance gates are documented in [docs/production_acceptance.md](docs/production_acceptance.md). Rust 1.95+ is required.

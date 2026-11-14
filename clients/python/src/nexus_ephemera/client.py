@@ -87,7 +87,7 @@ class NexusClient:
         async def once() -> Receipt:
             return await self._call(endpoint, payload_hash, idempotency_key)
 
-        return await self._retry(once)
+        return await self._within_budget(once)
 
     async def metrics(self) -> MetricsSnapshot:
         """Read the broker's five counters. The frame carries no call fields."""
@@ -95,13 +95,21 @@ class NexusClient:
         async def once() -> MetricsSnapshot:
             return await self._metrics_once()
 
-        return await self._retry(once)
+        return await self._within_budget(once)
 
     def __repr__(self) -> str:
         return (
             f"NexusClient(listen={self._listen!r}, timeout={self._timeout!r}, "
             f"max_payload_bytes={self._max_payload!r})"
         )
+
+    async def _within_budget(self, operation: Callable[[], Awaitable[_T]]) -> _T:
+        """Bound connect, write, read, and retries by one `wait_for` budget."""
+
+        try:
+            return await asyncio.wait_for(self._retry(operation), self._timeout)
+        except TimeoutError as exc:
+            raise TimedOut() from exc
 
     async def _retry(self, operation: Callable[[], Awaitable[_T]]) -> _T:
         deadline = time.monotonic() + self._timeout

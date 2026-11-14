@@ -22,6 +22,7 @@ nexus-ephemera-memlock = { version = "0.2.0", path = "crates/memlock" }
 nexus-ephemera-ipc-os = { version = "0.2.0", path = "crates/ipc_os" }
 
 [package]
+rust-version = "1.95"
 name = "nexus-ephemera"
 version.workspace = true
 edition.workspace = true
@@ -55,8 +56,8 @@ tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chacha20poly1305 = "0.10"
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = { version = "0.11.1", features = ["zeroize"] }
+orion = { version = "0.18.1", default-features = false, features = ["zeroize"] }
 subtle = "2.6"
 base64 = "0.22"
 uuid = { version = "1.6", features = ["v4", "serde"] }

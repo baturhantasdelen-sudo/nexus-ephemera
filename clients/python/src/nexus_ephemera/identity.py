@@ -12,6 +12,27 @@ import struct
 from .errors import IdentityRejected, IdentityUnavailable
 
 
+def peer_socket_ready(sock: object) -> int:
+    """Return a usable fd when the object can answer a peer-credential check.
+
+    asyncio wraps the connected socket in ``TransportSocket``. That wrapper is
+    not a ``socket.socket``, but it exposes ``fileno`` and ``getsockopt``, which
+    is what ``SO_PEERCRED`` and ``getpeereid`` need.
+    """
+
+    fileno = getattr(sock, "fileno", None)
+    getsockopt = getattr(sock, "getsockopt", None)
+    if not callable(fileno) or not callable(getsockopt):
+        raise IdentityUnavailable("ipc: caller identity unavailable")
+    try:
+        fd = fileno()
+    except (OSError, AttributeError, TypeError, ValueError) as exc:
+        raise IdentityUnavailable("ipc: caller identity unavailable") from exc
+    if isinstance(fd, bool) or not isinstance(fd, int) or fd < 0:
+        raise IdentityUnavailable("ipc: caller identity unavailable")
+    return fd
+
+
 def assess_peer(pid: int, uid: int, current_uid: int) -> None:
     """Accept a connected peer only when its pid is live and its uid is ours."""
 

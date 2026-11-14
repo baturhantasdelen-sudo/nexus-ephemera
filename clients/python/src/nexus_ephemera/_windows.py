@@ -3,6 +3,10 @@
 Pipe reads use overlapped I/O and a wait so a stalled broker cannot pin a
 worker past the client timeout. The server process user SID is compared
 before the first write. This is not mTLS.
+
+`OVERLAPPED` and the byte buffer stay referenced until `GetOverlappedResult`
+returns, including after `CancelIoEx`. Cancellation requests cleanup without
+blocking the event loop; bounded workers retain data until native completion.
 """
 
 from __future__ import annotations
@@ -23,10 +27,14 @@ else:
     import asyncio
     import ctypes
     import threading
+    from collections.abc import Callable
     from ctypes import wintypes
+    from typing import Any, TypeVar
 
     from .errors import IdentityRejected, IdentityUnavailable, TimedOut
     from .framing import wipe
+
+    _R = TypeVar("_R")
 
     _GENERIC_READ_WRITE = 0xC0000000
     _OPEN_EXISTING = 3
@@ -319,6 +327,68 @@ else:
         if not same:
             raise IdentityRejected("ipc: caller identity rejected")
 
+    # A permanently stuck driver may retain an operation, but cannot create
+    # unbounded worker/buffer/handle growth. Admission fails closed at this cap.
+    _MAX_WORKERS = 32
+    _WORKER_SLOTS = threading.BoundedSemaphore(_MAX_WORKERS)
+
+    async def _await_worker(
+        func: Callable[..., _R], *args: Any,
+        on_cancel: Callable[[], None] | None = None,
+        on_rejected: Callable[[], None] | None = None,
+    ) -> _R:
+        """Cancellation returns promptly; the bounded worker retains ownership.
+
+        Native cleanup runs in the worker, never in a cancelled coroutine.
+        No join or blocking wait is performed on the event-loop thread.
+        """
+        slots = _WORKER_SLOTS
+        if not slots.acquire(blocking=False):
+            if on_rejected is not None:
+                on_rejected()
+            raise IoFailure("ipc io: pending operation capacity exhausted")
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[_R] = loop.create_future()
+
+        def deliver(value: _R) -> None:
+            if not future.done():
+                future.set_result(value)
+
+        def fail(error: BaseException) -> None:
+            if not future.done():
+                future.set_exception(error)
+
+        def run() -> None:
+            try:
+                value = func(*args)
+            except BaseException as exc:
+                try:
+                    loop.call_soon_threadsafe(fail, exc)
+                except RuntimeError:
+                    pass  # Loop closed; the worker has already cleaned up.
+            else:
+                try:
+                    loop.call_soon_threadsafe(deliver, value)
+                except RuntimeError:
+                    pass
+            finally:
+                slots.release()
+
+        worker = threading.Thread(target=run, name="nexus-pipe-io", daemon=True)
+        try:
+            worker.start()
+        except BaseException:
+            slots.release()
+            if on_rejected is not None:
+                on_rejected()
+            raise
+        try:
+            return await future
+        except asyncio.CancelledError:
+            if on_cancel is not None:
+                on_cancel()
+            raise
+
     class _Pipe:
         def __init__(self, handle: int, timeout: float) -> None:
             _require_layout()
@@ -331,20 +401,38 @@ else:
             self._idle = threading.Event()
             self._idle.set()
             self._closed = False
+            self._held: list[object] = []
             self._event = _create_event()
 
+        def _retain(self, obj: object) -> None:
+            with self._lock:
+                self._held.append(obj)
+
+        def _release(self, obj: object) -> None:
+            with self._lock:
+                for index, held in enumerate(self._held):
+                    if held is obj:
+                        del self._held[index]
+                        return
+
         async def readexactly(self, n: int) -> bytes:
-            return await asyncio.to_thread(self._read_exact, n)
+            return await _await_worker(self._read_exact, n, on_cancel=self._close)
 
         async def write(self, data: bytes | bytearray | memoryview) -> None:
             payload = bytearray(data)
-            try:
-                await asyncio.to_thread(self._write_all, payload)
-            finally:
-                wipe(payload)
+
+            def run() -> None:
+                self._retain(payload)
+                try:
+                    self._write_all(payload)
+                finally:
+                    wipe(payload)
+                    self._release(payload)
+
+            await _await_worker(run, on_cancel=self._close, on_rejected=lambda: wipe(payload))
 
         async def close(self) -> None:
-            await asyncio.to_thread(self._close)
+            self._close()
 
         def _begin(self) -> None:
             with self._lock:
@@ -358,6 +446,8 @@ else:
             with self._lock:
                 self._busy -= 1
                 if self._busy == 0:
+                    if self._closed:
+                        self._close_handles_locked()
                     self._idle.set()
 
         def _read_exact(self, n: int) -> bytes:
@@ -380,10 +470,12 @@ else:
         def _write_all(self, payload: bytearray) -> None:
             with self._op:
                 self._begin()
+                view: ctypes.Array[ctypes.c_char] | None = None
                 try:
                     if not payload:
                         return
                     view = (ctypes.c_char * len(payload)).from_buffer(payload)
+                    self._retain(view)
                     base = ctypes.addressof(view)
                     sent = 0
                     total = len(payload)
@@ -393,71 +485,97 @@ else:
                             raise IoFailure("ipc io: short write")
                         sent += wrote
                 finally:
+                    if view is not None:
+                        self._release(view)
                     self._end()
 
         def _read_some(self, size: int) -> bytes:
             buf = ctypes.create_string_buffer(size)
+            self._retain(buf)
             try:
                 count = self._transfer(ctypes.addressof(buf), size, write=False)
                 if count <= 0:
                     return b""
-                return buf.raw[:count]
+                return bytes(buf.raw[:count])
             finally:
                 ctypes.memset(buf, 0, size)
+                self._release(buf)
 
         def _transfer(self, address: int, size: int, *, write: bool) -> int:
             k32 = _dlls().kernel32
             overlapped = _OVERLAPPED()
             overlapped.hEvent = self._event
-            with self._lock:
-                if self._closed or self._handle == 0:
-                    raise IoFailure("ipc io: closed")
-                k32.ResetEvent(self._event)
-                starter = k32.WriteFile if write else k32.ReadFile
-                immediate = wintypes.DWORD(0)
-                ok = bool(
-                    starter(
-                        self._handle,
-                        address,
-                        size,
-                        ctypes.addressof(immediate),
-                        ctypes.addressof(overlapped),
+            self._retain(overlapped)
+            handle = 0
+            started = False
+            try:
+                with self._lock:
+                    if self._closed or self._handle == 0:
+                        raise IoFailure("ipc io: closed")
+                    k32.ResetEvent(self._event)
+                    starter = k32.WriteFile if write else k32.ReadFile
+                    immediate = wintypes.DWORD(0)
+                    ok = bool(
+                        starter(
+                            self._handle,
+                            address,
+                            size,
+                            ctypes.addressof(immediate),
+                            ctypes.addressof(overlapped),
+                        )
                     )
-                )
-                err = int(ctypes.get_last_error())
-                handle = self._handle
-                transferred_now = int(immediate.value)
-            if ok:
-                return transferred_now
-            if err != _ERROR_IO_PENDING:
-                _raise_transfer(err, write)
-            if not ok:
+                    err = int(ctypes.get_last_error())
+                    handle = self._handle
+                    transferred_now = int(immediate.value)
+                if ok:
+                    return transferred_now
+                if err != _ERROR_IO_PENDING:
+                    _raise_transfer(err, write)
+                started = True
                 waited = int(k32.WaitForSingleObject(self._event, self._timeout_ms))
-                if waited == _WAIT_TIMEOUT:
+                if waited != _WAIT_OBJECT_0:
                     with self._lock:
                         if self._handle:
                             k32.CancelIoEx(self._handle, ctypes.addressof(overlapped))
-                    k32.WaitForSingleObject(self._event, 5000)
+                try:
+                    count = _overlapped_count(handle, overlapped, write)
+                finally:
+                    started = False
+                if waited == _WAIT_TIMEOUT:
                     raise TimedOut()
-                if waited != _WAIT_OBJECT_0:
-                    raise IoFailure("ipc io: wait failed")
-            return _overlapped_count(handle, overlapped, write)
+                if waited == _WAIT_OBJECT_0:
+                    return count
+                raise IoFailure("ipc io: wait failed")
+            finally:
+                if started and handle:
+                    with self._lock:
+                        if self._handle:
+                            k32.CancelIoEx(self._handle, ctypes.addressof(overlapped))
+                    try:
+                        _overlapped_count(handle, overlapped, write)
+                    except (TimedOut, IoFailure):
+                        pass
+                self._release(overlapped)
+
+        def _close_handles_locked(self) -> None:
+            # Only called with _lock held and no operation using these handles.
+            if self._handle:
+                _dlls().kernel32.CloseHandle(self._handle)
+                self._handle = 0
+            if self._event:
+                _dlls().kernel32.CloseHandle(self._event)
+                self._event = 0
 
         def _close(self) -> None:
-            k32 = _dlls().kernel32
             with self._lock:
                 self._closed = True
-                handle = self._handle
-            if handle:
-                k32.CancelIoEx(handle, None)
-            self._idle.wait((self._timeout_ms / 1000) + 5)
-            with self._lock:
-                if self._handle:
-                    k32.CloseHandle(self._handle)
-                    self._handle = 0
-                if self._event:
-                    k32.CloseHandle(self._event)
-                    self._event = 0
+                if self._busy:
+                    if self._handle:
+                        _dlls().kernel32.CancelIoEx(self._handle, None)
+                    # The active worker owns buffers + OVERLAPPED until terminal
+                    # completion. _end performs deferred handle/event cleanup.
+                    return
+                self._close_handles_locked()
 
     def _overlapped_count(handle: int, overlapped: _OVERLAPPED, write: bool) -> int:
         transferred = wintypes.DWORD(0)
@@ -465,7 +583,7 @@ else:
             handle,
             ctypes.addressof(overlapped),
             ctypes.byref(transferred),
-            False,
+            True,
         )
         if not ok:
             err = int(ctypes.get_last_error())
@@ -485,14 +603,50 @@ else:
             raise IoFailure("ipc io: access denied", permission_denied=True)
         raise IoFailure(f"ipc io: winerror {err}")
 
+    class _Opening:
+        """Own a late-created pipe until the awaiting coroutine claims it."""
+        def __init__(self, listen: str, timeout: float) -> None:
+            self._listen = listen
+            self._timeout = timeout
+            self._lock = threading.Lock()
+            self._cancelled = False
+            self._pipe: _Pipe | None = None
+
+        def cancel(self) -> None:
+            with self._lock:
+                self._cancelled = True
+                pipe, self._pipe = self._pipe, None
+            if pipe is not None:
+                pipe._close()
+
+        def run(self) -> None:
+            handle = _open_handle(self._listen, self._timeout)
+            accepted = False
+            try:
+                _require_server_user(handle)
+                pipe = _Pipe(handle, self._timeout)
+                accepted = True
+            finally:
+                if not accepted:
+                    _close_handle(handle)
+            with self._lock:
+                if self._cancelled:
+                    pipe._close()
+                    return
+                self._pipe = pipe
+
+        def claim(self) -> _Pipe:
+            with self._lock:
+                if self._cancelled or self._pipe is None:
+                    raise TimedOut()
+                pipe, self._pipe = self._pipe, None
+                return pipe
+
     async def open_pipe(listen: str, timeout: float) -> Stream:
-        handle = _open_handle(listen, timeout)
-        accepted = False
+        opening = _Opening(listen, timeout)
         try:
-            _require_server_user(handle)
-            pipe = _Pipe(handle, timeout)
-            accepted = True
-            return pipe
-        finally:
-            if not accepted:
-                _close_handle(handle)
+            await _await_worker(opening.run, on_cancel=opening.cancel)
+            return opening.claim()
+        except BaseException:
+            opening.cancel()
+            raise

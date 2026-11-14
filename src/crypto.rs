@@ -269,8 +269,8 @@ pub enum SignatureError {
 /// HMAC-SHA256 over the length-prefixed canonical request.
 ///
 /// The header is `t=<unix ms>,v1=<hex>`. It is not the binding digest and it
-/// is not mTLS. The derived signing key is wiped before this returns. The
-/// header value is what the receiver checks; it is not the secret.
+/// is not mTLS. The derived signing key and the raw MAC are wiped before this
+/// returns. The header value is what the receiver checks; it is not the secret.
 pub fn sign_request_header(
     secret: &[u8],
     timestamp_unix_ms: u64,
@@ -285,8 +285,9 @@ pub fn sign_request_header(
         payload_hash,
         endpoint,
     );
-    let header = format!("t={timestamp_unix_ms},v1={}", hex_encode(mac.as_slice()));
-    header
+    let encoded = hex_encode(mac.unprotected_as_ref());
+    drop(mac);
+    format!("t={timestamp_unix_ms},v1={encoded}")
 }
 
 /// Check `X-Nexus-Signature` against the same secret and a 5 second skew.
@@ -306,10 +307,22 @@ pub fn verify_request_header(
         return Err(SignatureError::Expired);
     }
     let expected = request_mac(secret, timestamp, idempotency_key, payload_hash, endpoint);
-    if presented.len() != expected.len() || !bool::from(presented.ct_eq(expected.as_slice())) {
+    if presented.len() != expected.unprotected_as_ref().len()
+        || !bool::from(presented.ct_eq(expected.unprotected_as_ref()))
+    {
         return Err(SignatureError::Invalid);
     }
     Ok(())
+}
+
+// Orion's explicit zeroize feature scrubs HMAC pads, hash state and Secret
+// storage on Drop. These guards cover normal exits and unwinding, not compiler
+// register copies, physical attacks or arbitrary process termination.
+use orion::hazardous::mac::hmac::sha256::{HmacSha256, SecretKey as HmacKey, Tag as HmacTag};
+
+fn keyed_mac(key: &[u8]) -> HmacSha256 {
+    let guarded = HmacKey::try_from(key).expect("HMAC-SHA256 accepts this bounded key");
+    HmacSha256::new(&guarded)
 }
 
 fn request_mac(
@@ -318,52 +331,37 @@ fn request_mac(
     idempotency_key: &str,
     payload_hash: &str,
     endpoint: &str,
-) -> Zeroizing<[u8; 32]> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-
+) -> HmacTag {
     let signing_key = derive_signing_key(secret);
-    let mut canonical = Zeroizing::new(Vec::with_capacity(128));
-    canonical.extend_from_slice(b"v1");
-    canonical.extend_from_slice(&timestamp_unix_ms.to_le_bytes());
-    push_len(&mut canonical, idempotency_key.as_bytes());
-    push_len(&mut canonical, payload_hash.as_bytes());
-    push_len(&mut canonical, endpoint.as_bytes());
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(signing_key.as_slice())
-        .expect("sha256 hmac accepts any key");
-    mac.update(canonical.as_slice());
-    let bytes = mac.finalize().into_bytes();
-    let mut out = Zeroizing::new([0u8; 32]);
-    out.copy_from_slice(&bytes);
-    out
+    let mut mac = keyed_mac(signing_key.unprotected_as_ref());
+    drop(signing_key);
+    mac.update(b"v1").expect("fresh MAC");
+    mac.update(&timestamp_unix_ms.to_le_bytes())
+        .expect("bounded MAC");
+    // Stream metadata rather than reallocating a canonical heap buffer.
+    for field in [
+        idempotency_key.as_bytes(),
+        payload_hash.as_bytes(),
+        endpoint.as_bytes(),
+    ] {
+        mac.update(&(field.len() as u64).to_le_bytes())
+            .expect("bounded MAC");
+        mac.update(field).expect("bounded MAC");
+    }
+    mac.finalize().expect("MAC finalized exactly once")
 }
 
-fn derive_signing_key(secret: &[u8]) -> Zeroizing<[u8; 32]> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-
-    let mut extract = <HmacSha256 as Mac>::new_from_slice(b"nexus-ephemera-hmac-v1")
-        .expect("sha256 hmac accepts any key");
-    extract.update(secret);
-    let prk_raw = extract.finalize().into_bytes();
-    let mut prk = Zeroizing::new([0u8; 32]);
-    prk.copy_from_slice(&prk_raw);
-    let mut expand =
-        <HmacSha256 as Mac>::new_from_slice(prk.as_slice()).expect("sha256 hmac accepts any key");
-    expand.update(b"nexus-ephemera-request-signature-v1");
-    expand.update(&[0x01]);
-    let okm = expand.finalize().into_bytes();
-    let mut out = Zeroizing::new([0u8; 32]);
-    out.copy_from_slice(&okm);
-    out
-}
-
-fn push_len(out: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(bytes);
+fn derive_signing_key(secret: &[u8]) -> HmacTag {
+    let mut extract = keyed_mac(b"nexus-ephemera-hmac-v1");
+    extract.update(secret).expect("bounded input");
+    let prk = extract.finalize().expect("extract finalized once");
+    let mut expand = keyed_mac(prk.unprotected_as_ref());
+    drop(prk);
+    expand
+        .update(b"nexus-ephemera-request-signature-v1")
+        .expect("fixed info");
+    expand.update(&[0x01]).expect("one expansion block");
+    expand.finalize().expect("expand finalized once")
 }
 
 fn parse_signature_header(header: &str) -> Result<(u64, Zeroizing<Vec<u8>>), SignatureError> {
@@ -441,6 +439,37 @@ pub fn open(blob: &SealedBlob) -> Result<Zeroizing<Vec<u8>>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signature_protocol_matches_independent_python_vector() {
+        let key: Vec<u8> = (0..32).collect();
+        assert_eq!(
+            super::sign_request_header(
+                &key,
+                1_700_000_000_123,
+                "idem-vector",
+                "sha256:payload-vector",
+                "https://provider.example/charge"
+            ),
+            "t=1700000000123,v1=c89140845568b7e6eb113835b2916b0c43dc7437155c2f93a2d8c3d24d06effd"
+        );
+    }
+
+    #[test]
+    fn guarded_hmac_matches_rfc4231_known_answer() {
+        let mut mac = super::keyed_mac(&[0x0b; 20]);
+        mac.update(b"Hi There").expect("update");
+        let tag = mac.finalize().expect("finalize");
+        assert_eq!(
+            super::hex_encode(tag.unprotected_as_ref()),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        // Secret-bearing backend types contain drop guards; feature selection
+        // and the backend's state/pad wiping are documented in the contract.
+        assert!(std::mem::needs_drop::<super::HmacKey>());
+        assert!(std::mem::needs_drop::<super::HmacTag>());
+        assert!(std::mem::needs_drop::<super::HmacSha256>());
+    }
+
     use super::*;
 
     #[test]

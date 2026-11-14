@@ -32,6 +32,7 @@ from nexus_ephemera.errors import IdentityUnavailable
 from nexus_ephemera.framing import Stream, read_frame, wipe, write_frame
 from nexus_ephemera.identity import (
     assess_peer,
+    peer_socket_ready,
     require_private_unix_socket,
     unpack_ucred,
 )
@@ -489,6 +490,44 @@ def test_io_failure_retries_and_identity_does_not(
     asyncio.run(scenario())
 
 
+def test_peer_socket_ready_accepts_a_transport_wrapper() -> None:
+    import socket
+
+    class TransportSocket:
+        def __init__(self, fd: int) -> None:
+            self._fd = fd
+
+        def fileno(self) -> int:
+            return self._fd
+
+        def getsockopt(self, level: int, optname: int, buflen: int) -> bytes:
+            return b""
+
+    assert peer_socket_ready(TransportSocket(7)) == 7
+    with pytest.raises(IdentityUnavailable):
+        peer_socket_ready(object())
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        assert peer_socket_ready(sock) == sock.fileno()
+    finally:
+        sock.close()
+
+
+def test_timeout_budget_cancels_a_stuck_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        async def open_broker(listen: str, timeout: float) -> Stream:
+            await asyncio.sleep(5)
+            raise AssertionError((listen, timeout))
+
+        monkeypatch.setattr(transport, "open_broker", open_broker)
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(TimedOut):
+            await NexusClient("local", timeout=0.05).metrics()
+        assert asyncio.get_running_loop().time() - started < 1
+
+    asyncio.run(scenario())
+
+
 def test_timeout_is_retried_until_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         opens = 0
@@ -549,6 +588,114 @@ async def _live_unix() -> None:
         await server.wait_closed()
         os.unlink(path)
         os.rmdir(directory)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="named pipe worker")
+def test_cancelled_worker_keeps_the_buffer_until_io_finishes() -> None:
+    import threading
+    from nexus_ephemera._windows import _await_worker
+    from nexus_ephemera.framing import wipe
+
+    async def scenario() -> None:
+        payload = bytearray(b"secret-bytes")
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        def run() -> None:
+            started.set()
+            try:
+                assert release.wait(1), "event-loop release was blocked by join"
+                assert bytes(payload) == b"secret-bytes"
+            finally:
+                wipe(payload)
+                finished.set()
+        task = asyncio.create_task(_await_worker(run))
+        assert await asyncio.to_thread(started.wait, 1)
+        # Only this coroutine may release the worker after cancellation. A
+        # blocking join prevents this until the worker test watchdog fires.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not finished.is_set()
+        assert payload == b"secret-bytes"
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 1)
+        assert payload == bytes(len(payload))
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="named pipe worker")
+def test_close_defers_handles_until_native_operation_is_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+    from nexus_ephemera import _windows as win
+    class Kernel:
+        def __init__(self) -> None:
+            self.closed: list[int] = []
+            self.cancelled = False
+        def CloseHandle(self, handle: int) -> int:
+            self.closed.append(handle)
+            return 1
+        def CancelIoEx(self, *_args: object) -> int:
+            self.cancelled = True
+            return 1
+    kernel = Kernel()
+    class Dll:
+        kernel32 = kernel
+    monkeypatch.setattr(win, "_dlls", lambda: Dll())
+    pipe = win._Pipe.__new__(win._Pipe)
+    pipe._lock = threading.Lock()
+    pipe._handle, pipe._event = 101, 102
+    pipe._closed, pipe._busy = False, 1
+    pipe._idle = threading.Event()
+    pipe._close()
+    assert kernel.cancelled and kernel.closed == []
+    pipe._end()  # Real workers call this only after collecting completion.
+    assert kernel.closed == [101, 102]
+    assert pipe._handle == pipe._event == 0
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="named pipe worker")
+def test_worker_capacity_fails_closed_without_starting(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+    from nexus_ephemera import _windows as win
+    gate = threading.BoundedSemaphore(1)
+    gate.acquire()
+    monkeypatch.setattr(win, "_WORKER_SLOTS", gate)
+    invoked: list[str] = []
+    async def scenario() -> None:
+        with pytest.raises(IoFailure):
+            await win._await_worker(lambda: invoked.append("worker"), on_rejected=lambda: invoked.append("scrub"))
+    try:
+        asyncio.run(scenario())
+        assert invoked == ["scrub"]
+    finally:
+        gate.release()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="named pipe worker")
+def test_cancelled_open_closes_a_late_created_handle(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+    from nexus_ephemera import _windows as win
+    started, release, closed = threading.Event(), threading.Event(), threading.Event()
+    def delayed_open(*_args: object) -> int:
+        started.set()
+        assert release.wait(1)
+        return 123
+    class FakePipe:
+        def __init__(self, *_args: object) -> None:
+            pass
+        def _close(self) -> None:
+            closed.set()
+    monkeypatch.setattr(win, "_open_handle", delayed_open)
+    monkeypatch.setattr(win, "_require_server_user", lambda _handle: None)
+    monkeypatch.setattr(win, "_Pipe", FakePipe)
+    async def scenario() -> None:
+        task = asyncio.create_task(win.open_pipe("controlled", 1))
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(closed.wait, 1)
+    asyncio.run(scenario())
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="named pipe")

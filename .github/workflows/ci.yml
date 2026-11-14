@@ -5,6 +5,7 @@ on:
     branches: [ main, master, release/* ]
   pull_request:
     branches: [ main, master ]
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,10 +24,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain (${{ matrix.rust }})
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
@@ -38,6 +39,26 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python SDK dev tools
+        working-directory: clients/python
+        run: python -m pip install --disable-pip-version-check -e ".[dev]"
+
+      - name: Type-check Python SDK (mypy --strict)
+        working-directory: clients/python
+        run: python -m mypy --strict
+
+      - name: Test Python SDK (pytest)
+        working-directory: clients/python
+        run: python -m pytest
+
+      - name: Test release packaging and architecture rejection
+        run: python -m unittest discover -s scripts/tests -v
 
       - name: Run release test suite (including Linux fork & memlock probes)
         if: runner.os != 'Linux'
