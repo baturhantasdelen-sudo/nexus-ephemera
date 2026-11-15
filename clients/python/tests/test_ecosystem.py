@@ -36,6 +36,9 @@ class CountingBroker:
         self.edge = edge
         self._cache: dict[str, Receipt] = {}
 
+    async def execute_payload(self, endpoint: str, payload: bytes, idempotency_key: str) -> Receipt:
+        return await self.execute(endpoint, hashlib.sha256(payload).hexdigest(), idempotency_key)
+
     async def execute(
         self, endpoint: str, payload_hash: str, idempotency_key: str
     ) -> Receipt:

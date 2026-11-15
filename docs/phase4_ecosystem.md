@@ -1,25 +1,16 @@
-# Phase 4 ecosystem adapters
+# Payload-bound ecosystem adapters
 
-These adapters sit in `nexus_ephemera.ecosystem`. They do not fetch or hold the broker secret. A tool name selects an operator `ToolRoute`. The route's endpoint is the only URL sent to `NexusClient.execute`. Call parameters cannot replace that URL.
+These are framework-neutral helpers, not certified native plugins for every release of MCP, LangChain, Portkey, CrewAI, Composio or Activepieces. Test the actual framework lifecycle in deployment.
 
-The binding digest on the receipt is not a MAC and not mTLS. The daemon computes the HMAC over the payload hash, endpoint, idempotency key, and timestamp. The Python process never sees that key.
+Register exact operator ToolRoutes and permitted parameter names. EcosystemGuard snapshots input and sends the exact immutable canonical JSON via execute_payload. Use TenantClient(NexusClient(...), account, scoped_token) against an enterprise-configured daemon. Provider/broker keys never enter the agent process. The server independently checks the current role policy, action, exact endpoint, parameter names and payload hash. Raw IPC cannot bypass this gate.
 
-## MCP
+LangChainToolGuard.ainvoke and the compatibility before_invoke name both EXECUTE the remote operation and return its receipt. Never run a second local tool body afterwards. PortkeyGuardrail.before_request also performs the broker operation: do not forward again. Custom gateways must use the broker result as execution result and disable secondary forwarding.
 
-`handle_mcp_message` answers `initialize`, `tools/list`, and `tools/call`. A tool call's `arguments` are canonicalized, hashed, and passed to the local broker. The JSON-RPC result includes `seal_report` in both the text content and the `nexus` object. An unknown tool or a non-strict URL becomes JSON-RPC `-32003` (`TargetDenied`) and does not call the broker. The same idempotency key returns the cached receipt with `replayed` true and `duplicate_status` 409. `transport_status` remains the status on that cached receipt. The broker does not submit the call to the provider again.
+MCP tools/call, CrewAI, Composio and Activepieces helpers use the same execution path. Unknown tools, invalid routes and credential/URL parameters fail before dispatch with safe fixed errors. Partial/Failed cleanup and unsuccessful provider HTTP statuses are errors, not successful tool results.
 
-## LangChain
+Receipts correlate endpoint, body hash and original idempotency key. Cached duplicates carry replayed=true and duplicate_status=409 while preserving original transport_status. This metadata is not an HTTP 409 from the provider. Changed payloads under one key fail before redispatch. Pending/receipt capacities are bounded and reject new work when full. Durable server Redis claims remain authoritative across client restarts.
 
-`LangChainToolGuard.before_invoke` runs before the tool body. The body may run only after `seal_report` is `retained` or `complete`. The tool input is a mapping of declared parameters. A string input, an extra field, or a credential field is rejected. The wrapper does not import LangChain and does not accept an API key.
+Portkey error paths drop their own body reference and raise sanitized errors outside decoder exception contexts, avoiding JSONDecodeError.doc retention through chained exceptions. Caller-owned immutable Python objects are not guaranteed erased; never capture secret locals in exception logs. Framework callbacks must not independently dispatch after this adapter already executed.
 
-## Portkey
+See enterprise_runbooks.md for configuration, policy-bound tokens, persistent claims, checkpoint retention and release gates. Fake providers and Reference* stores are models, not real network/HA evidence. Regression tests cover malformed JSON, mutation, cleanup/provider failures, cache conflicts/capacity and cancellation budgets.
 
-`PortkeyGuardrail.before_request` compares the upstream URL to the registry. A different host, a query string, or a fragment raises `TargetDenied` before `execute`. The body must be the exact canonical payload bytes. Whitespace or a reordered document is `Malformed` and is not forwarded.
-
-## CrewAI, Composio, Activepieces
-
-`crewai_tool_call`, `composio_action`, and `activepieces_step` are the same guard. Parameter names such as `api_key`, `token`, `secret`, `endpoint`, and `url` are rejected and are not copied into the error text. A second identical call returns the cached receipt and sets `duplicate_status` to 409. The same key with a changed parameter is `IdempotencyConflict` and does not dispatch again.
-
-`ProviderEdge.submit` is the reference provider status: the first key returns 204 and a duplicate returns 409. The guard does not call it on replay. A counting broker used in tests records that the provider accepted the key once.
-
-The daemon proof is `tests/ecosystem_mcp_receipt.rs`. It checks the HMAC header, `SealReport::Retained`, a cached replay with one dispatch, an idempotency conflict, and `TargetDenied` for an off-allowlist or query/fragment URL.

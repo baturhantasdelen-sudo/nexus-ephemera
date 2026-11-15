@@ -61,7 +61,8 @@ pub struct TransportReply {
 }
 
 /// Bu çağrının mühür sonucu. `Retained` yetkinin açık kaldığı anlamına gelir.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SealReport {
     Retained,
     Complete,
@@ -110,7 +111,8 @@ impl PendingDispatch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransactionReceipt {
     pub target_endpoint: String,
     pub payload_hash: String,
@@ -123,6 +125,18 @@ pub struct TransactionReceipt {
 
 pub trait SecureTransport {
     fn dispatch(&mut self, call: &AuthorizedCall<'_>) -> Result<TransportReply, BrokerError>;
+
+    /// Enterprise execution must forward exactly the server-validated bytes.
+    /// Legacy hash-only providers cannot silently opt in.
+    fn dispatch_payload(
+        &mut self,
+        _call: &AuthorizedCall<'_>,
+        _payload: &[u8],
+    ) -> Result<TransportReply, BrokerError> {
+        Err(BrokerError::Transport(
+            "provider does not support bound payload execution",
+        ))
+    }
 }
 
 /// Ajan tutamacı. Anahtarı okuyan bir yöntemi yoktur.

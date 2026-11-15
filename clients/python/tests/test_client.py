@@ -161,6 +161,27 @@ def test_wipe_overwrites_the_buffer() -> None:
     assert bytes(buffer).count(0) == len(buffer)
 
 
+def test_tenant_payload_wire_binds_exact_body_hash_and_principal(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+    import hashlib
+    from nexus_ephemera import TenantClient
+
+    payload = b'{"params":{"amount":7},"tool":"charge"}'
+
+    async def call(client: NexusClient) -> object:
+        tenant = TenantClient(client, "billing", "SCOPED_BEARER_FIXTURE")
+        assert "SCOPED_BEARER_FIXTURE" not in repr(tenant)
+        return await tenant.execute_payload(_ENDPOINT, payload, "tenant-key")
+
+    result, seen, opens = asyncio.run(_run(monkeypatch, _receipt, call))
+    assert isinstance(result, dict)
+    assert opens == 1 and len(seen) == 1
+    assert base64.b64decode(seen[0]["payload"], validate=True) == payload
+    assert seen[0]["payload_hash"] == hashlib.sha256(payload).hexdigest()
+    assert seen[0]["authorization"] == {"account": "billing", "token": "SCOPED_BEARER_FIXTURE"}
+    assert seen[0]["idempotency_key"] == "tenant-key"
+
+
 def test_frame_prefix_is_little_endian() -> None:
     class Capture:
         def __init__(self) -> None:

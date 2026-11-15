@@ -11,6 +11,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  enterprise-redis:
+    name: Real Redis multiprocess claims and durable failure paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEXUS_TEST_REDIS_URL: redis://127.0.0.1:6379
+      NEXUS_TEST_RESTART_NAMESPACE: restart-${{ github.run_id }}-${{ github.run_attempt }}
+      CARGO_INCREMENTAL: '0'
+      RUSTFLAGS: '-D warnings'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+      - name: Require durable non-evicting Redis
+        run: |
+          set -euo pipefail
+          docker run -d --name nexus-enterprise-redis -p 127.0.0.1:6379:6379 redis:7.4 redis-server --appendonly yes --appendfsync always --maxmemory-policy noeviction
+          for i in {1..30}; do
+            if docker exec nexus-enterprise-redis redis-cli ping | grep -q PONG; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Run real backend tests (never silently skip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p outputs/ci-evidence
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo test --locked --release --lib enterprise_runtime::tests::redis_ -- --ignored --nocapture 2>&1 | tee outputs/ci-evidence/real-redis.log
+          cargo test --locked --release --test enterprise_live -- --ignored --nocapture 2>&1 | tee outputs/ci-evidence/enterprise-live.log
+          cargo test --locked --release --lib enterprise_runtime::tests::restart_seed_committed_receipt -- --ignored --exact --nocapture 2>&1 | tee outputs/ci-evidence/redis-restart-seed.log
+          docker restart nexus-enterprise-redis
+          for i in {1..30}; do
+            if docker exec nexus-enterprise-redis redis-cli ping | grep -q PONG; then break; fi
+            sleep 1
+          done
+          cargo test --locked --release --lib enterprise_runtime::tests::restart_verify_committed_receipt -- --ignored --exact --nocapture 2>&1 | tee outputs/ci-evidence/redis-restart-verify.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: real-redis-evidence
+          path: outputs/ci-evidence
+          if-no-files-found: error
+
   validate:
     name: Build, Clippy, Format & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

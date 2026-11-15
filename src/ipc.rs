@@ -235,6 +235,7 @@ pub enum ServedCall {
 }
 
 pub struct BrokerDaemon<T> {
+    enterprise: Option<std::sync::Arc<crate::enterprise_runtime::EnterpriseAdmission>>,
     agent: SecureTransactionAgent,
     transport: Option<T>,
     dispatch_inbox: Option<std::sync::mpsc::Receiver<(T, Result<TransportReply, BrokerError>)>>,
@@ -287,10 +288,59 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
         listen(config, agent, transport)
     }
 
+    /// Enterprise mode has one mandatory server-side tenant/store gate. Legacy
+    /// execute calls without proof/payload fail closed in this mode.
+    pub async fn bind_enterprise(
+        config: DaemonConfig,
+        secret: &mut [u8],
+        transport: T,
+        directory: crate::enterprise::TenantDirectory,
+        store: std::sync::Arc<crate::enterprise_runtime::RedisIdempotency>,
+        sink: std::sync::Arc<dyn crate::enterprise_runtime::CheckpointSink>,
+    ) -> Result<Self, IpcError> {
+        struct SecretOnExit<'a>(&'a mut [u8]);
+        impl Drop for SecretOnExit<'_> {
+            fn drop(&mut self) {
+                self.0.zeroize();
+            }
+        }
+        let secret = SecretOnExit(secret);
+        let authority = crate::enterprise_runtime::TenantAuthority::new(directory, secret.0);
+        let result = match authority {
+            Ok(authority) => {
+                let admission = tokio::task::spawn_blocking(move || {
+                    crate::enterprise_runtime::EnterpriseAdmission::new(authority, store, sink)
+                })
+                .await
+                .map_err(|_| IpcError::Protocol("enterprise startup failed"))?;
+                match admission {
+                    Ok(admission) => {
+                        Self::bind(config, &mut *secret.0, transport)
+                            .await
+                            .map(|mut daemon| {
+                                daemon.enterprise = Some(std::sync::Arc::new(admission));
+                                daemon
+                            })
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        secret.0.zeroize();
+        result
+    }
+
     /// Consume the listener and explicitly verify secret cleanup. An outstanding
     /// provider is uncertain, even if managed secret cleanup succeeds.
     pub fn shutdown(mut self) -> Result<crate::broker::SealReport, IpcError> {
         let seal = self.agent.close();
+        let enterprise_cleanup = self
+            .enterprise
+            .as_ref()
+            .map(|enterprise| enterprise.close())
+            .transpose();
+        enterprise_cleanup?;
         if seal != crate::broker::SealReport::Complete {
             return Err(IpcError::Protocol("daemon cleanup incomplete"));
         }
@@ -326,6 +376,11 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
             }
         };
         if request.op == WireOp::Metrics {
+            if self.enterprise.is_some() {
+                let outcome = Err(IpcError::TargetDenied);
+                write_response(stream, &outcome, self.max_payload_bytes, self.timeout).await?;
+                return Err(IpcError::TargetDenied);
+            }
             let snapshot = crate::metrics::snapshot();
             let mut encoded = serde_json::to_vec(&MetricsFrame::from(snapshot))
                 .map_err(|_| IpcError::Malformed)?;
@@ -501,6 +556,7 @@ fn listen<T: SecureTransport + Send + 'static>(
     listen_lock.record_pid()?;
     let daemon_uid = nexus_ephemera_ipc_os::current_uid()?;
     Ok(BrokerDaemon {
+        enterprise: None,
         agent,
         transport: Some(transport),
         dispatch_inbox: None,
@@ -606,6 +662,7 @@ fn listen<T: SecureTransport + Send + 'static>(
         ));
     }
     let mut daemon = BrokerDaemon {
+        enterprise: None,
         agent,
         transport: Some(transport),
         dispatch_inbox: None,
@@ -679,6 +736,59 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
             });
         }
         resolve_allowlisted_endpoint(&self.allowlist, &request.endpoint)?;
+        if let Some(admission) = &self.enterprise {
+            use crate::enterprise_runtime::{Admission, TenantCredential};
+            use base64::Engine;
+            if self.transport.is_none() || self.dispatch_inbox.is_some() {
+                return Err(IpcError::Inconclusive);
+            }
+            let proof = request
+                .authorization
+                .as_ref()
+                .ok_or(IpcError::TargetDenied)?;
+            let proof = TenantCredential {
+                account: proof.account.clone(),
+                token: proof.token.clone(),
+            };
+            let encoded = request.payload.as_ref().ok_or(IpcError::Malformed)?;
+            let payload = zeroize::Zeroizing::new(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|_| IpcError::Malformed)?,
+            );
+            let admission = std::sync::Arc::clone(admission);
+            let endpoint = request.endpoint.clone();
+            let hash = request.payload_hash.clone();
+            let key = request.idempotency_key.clone();
+            let action = tokio::task::spawn_blocking(move || {
+                admission.begin(&proof, &endpoint, &payload, &hash, &key)
+            })
+            .await
+            .map_err(|_| IpcError::Inconclusive)??;
+            return match action {
+                Admission::Cached(receipt) => Ok(receipt),
+                Admission::Execute(operation) => {
+                    let scoped = WireRequest {
+                        op: WireOp::Call,
+                        endpoint: request.endpoint.clone(),
+                        payload_hash: request.payload_hash.clone(),
+                        idempotency_key: operation.provider_key().to_string(),
+                        authorization: None,
+                        payload: None,
+                    };
+                    let body = zeroize::Zeroizing::new(operation.payload().to_vec());
+                    let result = self.provider_call(&scoped, Some(body)).await;
+                    tokio::task::spawn_blocking(move || operation.finish(result))
+                        .await
+                        .map_err(|_| IpcError::Inconclusive)?
+                }
+            };
+        }
+        if request.authorization.is_some() || request.payload.is_some() {
+            return Err(IpcError::Protocol(
+                "tenant execution requires enterprise mode",
+            ));
+        }
         match self.idempotency.lookup(
             &request.idempotency_key,
             &request.endpoint,
@@ -690,13 +800,14 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
             Lookup::Miss if self.dispatch_inbox.is_some() || self.transport.is_none() => {
                 Err(IpcError::Inconclusive)
             }
-            Lookup::Miss => self.provider_call(request).await,
+            Lookup::Miss => self.provider_call(request, None).await,
         }
     }
 
     async fn provider_call(
         &mut self,
         request: &WireRequest,
+        payload: Option<zeroize::Zeroizing<Vec<u8>>>,
     ) -> Result<TransactionReceipt, IpcError> {
         let started = std::time::Instant::now();
         let endpoint = resolve_allowlisted_endpoint(&self.allowlist, &request.endpoint)?;
@@ -712,14 +823,17 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
             .map_err(client_outcome_err)?;
         // Reserve before any external side effect. Unknown outcomes are not
         // success receipts and must never silently age into a second dispatch.
-        self.idempotency.commit(
-            &request.idempotency_key,
-            &request.endpoint,
-            &request.payload_hash,
-            crate::idempotency::CachedBody::Pending,
-        );
+        if self.enterprise.is_none() {
+            self.idempotency.commit(
+                &request.idempotency_key,
+                &request.endpoint,
+                &request.payload_hash,
+                crate::idempotency::CachedBody::Pending,
+            );
+        }
         let mut transport = self.transport.take().ok_or(IpcError::Inconclusive)?;
         let call = OwnedProviderCall {
+            payload,
             target_endpoint: pending.command.target_endpoint.clone(),
             payload_hash: pending.command.payload_hash.clone(),
             binding_digest_hex: pending.digest.clone(),
@@ -733,7 +847,7 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
             .name("nexus-provider".into())
             .spawn(move || {
                 let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    transport.dispatch(&crate::broker::AuthorizedCall {
+                    let authorized = crate::broker::AuthorizedCall {
                         target_endpoint: &call.target_endpoint,
                         payload_hash: &call.payload_hash,
                         binding_digest_hex: &call.binding_digest_hex,
@@ -741,7 +855,11 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
                         issued_at_unix_ms: call.issued_at_unix_ms,
                         idempotency_key: &call.idempotency_key,
                         nexus_signature: &call.nexus_signature,
-                    })
+                    };
+                    match &call.payload {
+                        Some(payload) => transport.dispatch_payload(&authorized, payload),
+                        None => transport.dispatch(&authorized),
+                    }
                 }));
                 let reply = match reply {
                     Ok(reply) => reply,
@@ -791,6 +909,9 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
         started: std::time::Instant,
     ) {
         use crate::idempotency::CachedBody;
+        if self.enterprise.is_some() {
+            return;
+        }
         if matches!(
             outcome,
             Err(IpcError::Inconclusive | IpcError::TimedOut)
@@ -863,6 +984,7 @@ fn client_outcome_err(err: BrokerError) -> IpcError {
 }
 
 struct OwnedProviderCall {
+    payload: Option<zeroize::Zeroizing<Vec<u8>>>,
     target_endpoint: String,
     payload_hash: String,
     binding_digest_hex: String,
@@ -966,9 +1088,49 @@ impl NexusClient {
         Err(last)
     }
 
+    pub async fn execute_payload(
+        &self,
+        endpoint: &str,
+        payload: &[u8],
+        idempotency_key: &str,
+        account: &str,
+        token: &str,
+    ) -> Result<TransactionReceipt, IpcError> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        if account.is_empty() || account.len() > 64 || token.is_empty() || token.len() > 512 {
+            return Err(IpcError::TargetDenied);
+        }
+        if payload.is_empty() || payload.len() > self.max_payload_bytes {
+            return Err(IpcError::PayloadTooLarge {
+                limit: self.max_payload_bytes,
+            });
+        }
+        let hash: String = Sha256::digest(payload)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let request = WireRequest {
+            op: WireOp::Call,
+            endpoint: endpoint.to_string(),
+            payload_hash: hash,
+            idempotency_key: idempotency_key.to_string(),
+            authorization: Some(crate::enterprise_runtime::TenantCredential {
+                account: account.to_string(),
+                token: token.to_string(),
+            }),
+            payload: Some(base64::engine::general_purpose::STANDARD.encode(payload)),
+        };
+        tokio::time::timeout(self.timeout, self.exchange_call(&request))
+            .await
+            .map_err(|_| IpcError::TimedOut)?
+    }
+
     async fn metrics_once(&self) -> Result<crate::metrics::MetricsSnapshot, IpcError> {
         let request = WireRequest {
             op: WireOp::Metrics,
+            authorization: None,
+            payload: None,
             endpoint: String::new(),
             payload_hash: String::new(),
             idempotency_key: String::new(),
@@ -994,11 +1156,20 @@ impl NexusClient {
     ) -> Result<TransactionReceipt, IpcError> {
         let request = WireRequest {
             op: WireOp::Call,
+            authorization: None,
+            payload: None,
             endpoint: endpoint.to_string(),
             payload_hash: payload_hash.to_string(),
             idempotency_key: idempotency_key.to_string(),
         };
-        let mut body = serde_json::to_vec(&request).map_err(|_| IpcError::Malformed)?;
+        self.exchange_call(&request).await
+    }
+
+    async fn exchange_call(&self, request: &WireRequest) -> Result<TransactionReceipt, IpcError> {
+        let endpoint = request.endpoint.as_str();
+        let payload_hash = request.payload_hash.as_str();
+        let idempotency_key = request.idempotency_key.as_str();
+        let mut body = serde_json::to_vec(request).map_err(|_| IpcError::Malformed)?;
         if body.len() > self.max_payload_bytes {
             body.zeroize();
             return Err(IpcError::PayloadTooLarge {
@@ -1142,7 +1313,8 @@ enum WireOp {
     Metrics,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireRequest {
     #[serde(default)]
     op: WireOp,
@@ -1152,6 +1324,24 @@ struct WireRequest {
     payload_hash: String,
     #[serde(default)]
     idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization: Option<crate::enterprise_runtime::TenantCredential>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload: Option<String>,
+}
+
+impl std::fmt::Debug for WireRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WireRequest([REDACTED])")
+    }
+}
+
+impl Drop for WireRequest {
+    fn drop(&mut self) {
+        if let Some(payload) = &mut self.payload {
+            payload.zeroize();
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1632,6 +1822,8 @@ mod nine_point_audit {
                 .expect("bind");
             let request = WireRequest {
                 op: WireOp::Call,
+                authorization: None,
+                payload: None,
                 endpoint: "https://provider.example/charge".into(),
                 payload_hash: "hash-a".into(),
                 idempotency_key: "same-request".into(),

@@ -149,13 +149,43 @@ async def read_frame(stream: Stream, max_payload: int, timeout: float) -> bytear
     return bytearray(body)
 
 
+def json_depth_exceeded(raw: bytes | bytearray, limit: int = 64) -> bool:
+    """Bound parser nesting without treating brackets inside strings as syntax."""
+    depth = 0
+    quoted = False
+    escaped = False
+    for byte in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif byte == 92:
+                escaped = True
+            elif byte == 34:
+                quoted = False
+        elif byte == 34:
+            quoted = True
+        elif byte in (91, 123):
+            depth += 1
+            if depth > limit:
+                return True
+        elif byte in (93, 125):
+            depth -= 1
+    return False
+
+
 def load_json_object(raw: bytearray) -> object:
     """Parse JSON without chaining the decoder exception, which retains the doc."""
 
+    if json_depth_exceeded(raw):
+        raise Malformed()
+    invalid = False
+    parsed: object = None
     try:
-        parsed: object = json.loads(raw)
-    except json.JSONDecodeError:
-        raise Malformed() from None
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        invalid = True
+    if invalid:
+        raise Malformed()
     return parsed
 
 

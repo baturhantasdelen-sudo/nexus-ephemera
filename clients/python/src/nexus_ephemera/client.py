@@ -9,6 +9,9 @@ released for collection and are not stored on the client.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import math
 import time
 from collections.abc import Awaitable, Callable
@@ -21,6 +24,7 @@ from .errors import (
     PayloadTooLarge,
     ProtocolError,
     TimedOut,
+    TargetDenied,
     io_failure,
 )
 from .framing import (
@@ -97,6 +101,34 @@ class NexusClient:
 
         return await self._within_budget(once)
 
+    async def execute_payload(self, endpoint: str, payload: bytes, idempotency_key: str,
+                              *, account: str, token: str) -> Receipt:
+        """Enterprise execution: the server authenticates and forwards these bytes.
+
+        account/token are scoped tenant credentials, never the provider/broker key.
+        Hash-only execute cannot access an enterprise-mode daemon.
+        """
+        if not isinstance(payload, bytes) or not payload or len(payload) > self._max_payload:
+            raise PayloadTooLarge(self._max_payload)
+        if not account or len(account) > 64 or not token or len(token) > 512:
+            raise TargetDenied()
+        digest = hashlib.sha256(payload).hexdigest()
+        validate_call(endpoint, digest, idempotency_key)
+
+        async def once() -> Receipt:
+            frame = bytearray(json.dumps({"op": "call", "endpoint": endpoint, "payload_hash": digest,
+                "idempotency_key": idempotency_key, "authorization": {"account": account, "token": token},
+                "payload": base64.b64encode(payload).decode("ascii")}, separators=(",", ":")).encode("utf-8"))
+            try:
+                if len(frame) > self._max_payload:
+                    raise PayloadTooLarge(self._max_payload)
+                parsed = await self._exchange(frame)
+            finally:
+                wipe(frame)
+            return parse_call(parsed, endpoint=endpoint, payload_hash=digest, idempotency_key=idempotency_key)
+
+        return await self._within_budget(once)
+
     def __repr__(self) -> str:
         return (
             f"NexusClient(listen={self._listen!r}, timeout={self._timeout!r}, "
@@ -169,3 +201,20 @@ def _retryable(err: IpcError) -> bool:
     if isinstance(err, IoFailure):
         return not err.permission_denied
     return isinstance(err, TimedOut)
+
+
+class TenantClient:
+    """Bound principal for framework adapters. No raw provider credential API."""
+    __slots__ = ("_client", "_account", "_token")
+
+    def __init__(self, client: NexusClient, account: str, token: str) -> None:
+        if not account or len(account) > 64 or not token or len(token) > 512:
+            raise TargetDenied()
+        self._client, self._account, self._token = client, account, token
+
+    async def execute_payload(self, endpoint: str, payload: bytes, idempotency_key: str) -> Receipt:
+        return await self._client.execute_payload(endpoint, payload, idempotency_key,
+                                                 account=self._account, token=self._token)
+
+    def __repr__(self) -> str:
+        return "TenantClient([REDACTED])"

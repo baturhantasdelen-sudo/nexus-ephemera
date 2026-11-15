@@ -13,7 +13,7 @@ from nexus_ephemera.enterprise import (
     AuditEvent,
     AuditLedger,
     ServiceAccount,
-    SharedStore,
+    ReferenceSharedStore,
     TenantDirectory,
     WorkerGate,
 )
@@ -83,7 +83,7 @@ def test_audit_export_verifies_and_rejects_a_changed_decision() -> None:
 
 def test_cross_tenant_call_is_denied_before_the_shared_store() -> None:
     directory = _directory()
-    store = SharedStore()
+    store = ReferenceSharedStore()
     endpoint = directory.allow("billing", "charge", _CHARGE)
     assert endpoint == _CHARGE
     with pytest.raises(TargetDenied):
@@ -96,7 +96,7 @@ def test_cross_tenant_call_is_denied_before_the_shared_store() -> None:
 
 
 def test_shared_store_returns_the_cached_receipt_and_409() -> None:
-    store = SharedStore()
+    store = ReferenceSharedStore()
     first = store.execute("billing", _CHARGE, "hash-a", "idem-1", _DIGEST)
     second = store.execute("billing", _CHARGE, "hash-a", "idem-1", _DIGEST)
     assert first.duplicate_status is None
@@ -120,7 +120,7 @@ def test_shared_store_returns_the_cached_receipt_and_409() -> None:
 
 
 def test_two_callers_share_one_provider_hit() -> None:
-    store = SharedStore()
+    store = ReferenceSharedStore()
     barrier = threading.Barrier(2)
     results: list[object] = []
     lock = threading.Lock()

@@ -9,8 +9,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use nexus_ephemera::enterprise::{
-    AuditEvent, AuditKind, AuditLedger, ClusterCall, ClusterNode, DUPLICATE_PROVIDER_STATUS,
-    ServiceAccount, SharedIdempotency, TenantDirectory, WORKER_CAP, WorkerGate, verify_export,
+    AuditEvent, AuditKind, AuditLedger, DUPLICATE_PROVIDER_STATUS, ReferenceCall,
+    ReferenceClusterNode, ReferenceIdempotency, ServiceAccount, TenantDirectory, WORKER_CAP,
+    WorkerGate, verify_export,
 };
 use nexus_ephemera::ipc::IpcError;
 
@@ -52,7 +53,7 @@ fn chaos_resilience_keeps_one_dispatch_and_a_verifiable_log() {
     ));
     assert!(!token.contains("enterprise-tenant-secret"));
 
-    let store = Arc::new(SharedIdempotency::new(8).expect("store"));
+    let store = Arc::new(ReferenceIdempotency::new(8).expect("store"));
     let hits = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(2));
     let call = call("billing", "idem-1");
@@ -64,7 +65,7 @@ fn chaos_resilience_keeps_one_dispatch_and_a_verifiable_log() {
         let call = call.clone();
         threads.push(thread::spawn(move || {
             barrier.wait();
-            ClusterNode::new(store, hits).execute(&call)
+            ReferenceClusterNode::new(store, hits).execute(&call)
         }));
     }
     let results: Vec<_> = threads
@@ -72,7 +73,7 @@ fn chaos_resilience_keeps_one_dispatch_and_a_verifiable_log() {
         .map(|thread| thread.join().expect("join"))
         .collect();
     assert_eq!(hits.load(Ordering::SeqCst), 1, "{results:?}");
-    let cached = ClusterNode::new(Arc::clone(&store), Arc::clone(&hits))
+    let cached = ReferenceClusterNode::new(Arc::clone(&store), Arc::clone(&hits))
         .execute(&call)
         .expect("cached");
     assert_eq!(cached.duplicate_status, Some(DUPLICATE_PROVIDER_STATUS));
@@ -85,25 +86,26 @@ fn chaos_resilience_keeps_one_dispatch_and_a_verifiable_log() {
     let mut conflict = conflict;
     conflict.payload_hash = "hash-other".into();
     assert!(matches!(
-        ClusterNode::new(Arc::clone(&store), Arc::clone(&hits)).execute(&conflict),
+        ReferenceClusterNode::new(Arc::clone(&store), Arc::clone(&hits)).execute(&conflict),
         Err(IpcError::IdempotencyConflict)
     ));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
     let interrupted = call_named("billing", "idem-net");
     assert!(matches!(
-        ClusterNode::new(Arc::clone(&store), Arc::clone(&hits)).execute_interrupted(&interrupted),
+        ReferenceClusterNode::new(Arc::clone(&store), Arc::clone(&hits))
+            .execute_interrupted(&interrupted),
         Err(IpcError::Inconclusive)
     ));
     assert!(matches!(
-        ClusterNode::new(Arc::clone(&store), Arc::clone(&hits)).execute(&interrupted),
+        ReferenceClusterNode::new(Arc::clone(&store), Arc::clone(&hits)).execute(&interrupted),
         Err(IpcError::Inconclusive)
     ));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
     store.quarantine_for_rotation();
     assert!(matches!(
-        ClusterNode::new(Arc::clone(&store), Arc::clone(&hits))
+        ReferenceClusterNode::new(Arc::clone(&store), Arc::clone(&hits))
             .execute(&call_named("billing", "idem-new")),
         Err(IpcError::Protocol(_))
     ));
@@ -127,7 +129,7 @@ fn chaos_resilience_keeps_one_dispatch_and_a_verifiable_log() {
     drop(permits.pop());
     let _released = gate.try_acquire().expect("slot after release");
 
-    let mut ledger = AuditLedger::new();
+    let mut ledger = AuditLedger::try_new().expect("audit admission");
     ledger
         .append(&AuditEvent {
             kind: AuditKind::Retained,
@@ -166,13 +168,13 @@ fn chaos_resilience_keeps_one_dispatch_and_a_verifiable_log() {
         .expect("conflict");
     assert!(ledger.verify());
     let exported = ledger.export_json();
-    assert!(verify_export(&exported));
+    assert!(verify_export(&exported, &ledger.checkpoint()));
     assert!(exported.contains("\"kind\":\"retained\""));
     assert!(exported.contains("\"kind\":\"target_denied\""));
     assert!(exported.contains("\"kind\":\"idempotency_conflict\""));
     assert!(!exported.contains("enterprise-tenant-secret"));
-    let tampered = exported.replacen("hash-other", "hash-swapped", 1);
-    assert!(!verify_export(&tampered));
+    let tampered = exported.replacen("retained", "receipt", 1);
+    assert!(!verify_export(&tampered, &ledger.checkpoint()));
 }
 
 fn directory() -> TenantDirectory {
@@ -180,12 +182,16 @@ fn directory() -> TenantDirectory {
         ServiceAccount {
             id: "billing".into(),
             roles: vec!["charge".into()],
+            role_endpoints: Default::default(),
+            role_params: Default::default(),
             attributes: Vec::new(),
             allowlist: vec![CHARGE.into()],
         },
         ServiceAccount {
             id: "payments".into(),
             roles: vec!["refund".into()],
+            role_endpoints: Default::default(),
+            role_params: Default::default(),
             attributes: Vec::new(),
             allowlist: vec![REFUND.into()],
         },
@@ -193,12 +199,12 @@ fn directory() -> TenantDirectory {
     .expect("directory")
 }
 
-fn call(account: &str, key: &str) -> ClusterCall {
+fn call(account: &str, key: &str) -> ReferenceCall {
     call_named(account, key)
 }
 
-fn call_named(account: &str, key: &str) -> ClusterCall {
-    ClusterCall {
+fn call_named(account: &str, key: &str) -> ReferenceCall {
+    ReferenceCall {
         service_account_id: account.into(),
         endpoint: CHARGE.into(),
         payload_hash: "hash-a".into(),

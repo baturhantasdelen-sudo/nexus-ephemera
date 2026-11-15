@@ -1,13 +1,15 @@
 """Thin asyncio client for a same-user nexus-ephemera broker.
 
-`NexusClient.execute` sends an endpoint, a payload hash, and an idempotency
-key. `NexusClient.metrics` reads five integer counters. The broker secret is
+`TenantClient.execute_payload` sends exact payload bytes and scoped tenant
+authorization to an enterprise daemon. Legacy `NexusClient.execute` sends
+only a hash to a reference-mode daemon; it cannot bypass enterprise admission.
+`NexusClient.metrics` reads five integer counters in reference mode. The broker secret is
 not requested and is not returned. Unix sockets must be mode ``0600`` and
 owned by the current user before the client connects. Windows pipes must
 belong to the same user. Neither check is mTLS.
 """
 
-from .client import NexusClient
+from .client import NexusClient, TenantClient
 from .ecosystem import (
     DUPLICATE_PROVIDER_STATUS,
     ActionReceipt,
@@ -75,6 +77,7 @@ __all__ = [
     "Malformed",
     "MetricsSnapshot",
     "NexusClient",
+    "TenantClient",
     "PayloadTooLarge",
     "ProtocolError",
     "RateLimited",

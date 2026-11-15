@@ -9,6 +9,7 @@ pub mod broker;
 pub mod context;
 pub mod crypto;
 pub mod enterprise;
+pub mod enterprise_runtime;
 pub mod exposure;
 pub(crate) mod idempotency;
 pub mod ipc;

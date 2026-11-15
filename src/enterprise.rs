@@ -75,22 +75,51 @@ struct Chained {
     link: [u8; 32],
 }
 
-#[derive(Debug)]
 pub struct AuditLedger {
+    closed: bool,
+    key: crate::apoptosis::EphemeralBuffer,
     previous: [u8; 32],
     records: Vec<Chained>,
 }
 
+const AUDIT_CAPACITY: usize = 1024;
+const AUDIT_EXPORT_MAX: usize = 1024 * 1024;
+
+/// Obtain from a separately trusted store, never from the untrusted export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditCheckpoint {
+    pub head: [u8; 32],
+    pub merkle_root: [u8; 32],
+    pub records: u64,
+}
+
 impl AuditLedger {
-    pub fn new() -> Self {
-        Self {
+    pub fn try_new() -> Result<Self, IpcError> {
+        Ok(Self {
+            closed: false,
+            key: crate::apoptosis::EphemeralBuffer::from_os_rng(32)
+                .map_err(|_| IpcError::Protocol("audit key admission failed"))?,
             previous: [0; 32],
             records: Vec::new(),
-        }
+        })
     }
 
     pub fn append(&mut self, event: &AuditEvent) -> Result<[u8; 32], IpcError> {
-        let encoded = canonical_event(event)?;
+        if self.closed {
+            return Err(IpcError::Protocol("audit ledger is closed"));
+        }
+        if self.records.len() >= AUDIT_CAPACITY {
+            return Err(IpcError::Protocol("audit capacity exhausted"));
+        }
+        let encoded = self
+            .key
+            .with_sensitive_bytes(|key| {
+                if key.len() != 32 {
+                    return Err("audit key was wiped".into());
+                }
+                Ok(canonical_event(event, key))
+            })
+            .map_err(|_| IpcError::Protocol("audit key unavailable"))??;
         let Some(sequence) = u64::try_from(self.records.len())
             .ok()
             .and_then(|len| len.checked_add(1))
@@ -141,8 +170,24 @@ impl AuditLedger {
         self.previous
     }
 
+    pub fn checkpoint(&self) -> AuditCheckpoint {
+        AuditCheckpoint {
+            head: self.head(),
+            merkle_root: self.merkle_root(),
+            records: self.records.len() as u64,
+        }
+    }
+
+    pub fn close(&mut self) -> Result<(), IpcError> {
+        self.closed = true;
+        self.key.try_wipe().map_err(|_| {
+            crate::apoptosis::record_aux_unlock_failure();
+            IpcError::Protocol("audit key cleanup incomplete")
+        })
+    }
+
     pub fn export_json(&self) -> String {
-        let mut out = String::from("{\"head\":\"");
+        let mut out = String::from("{\"schema\":\"nexus-audit-v2\",\"head\":\"");
         out.push_str(&hex_encode(&self.previous));
         out.push_str("\",\"merkle_root\":\"");
         out.push_str(&hex_encode(&self.merkle_root()));
@@ -166,18 +211,25 @@ impl AuditLedger {
     }
 }
 
-impl Default for AuditLedger {
-    fn default() -> Self {
-        Self::new()
+impl std::fmt::Debug for AuditLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLedger")
+            .field("records", &self.records.len())
+            .finish_non_exhaustive()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceAccount {
     pub id: String,
     pub roles: Vec<String>,
     pub attributes: Vec<(String, String)>,
     pub allowlist: Vec<String>,
+    #[serde(default)]
+    pub role_endpoints: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub role_params: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,11 +237,13 @@ pub struct TenantDirectory {
     accounts: BTreeMap<String, AccountPolicy>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct AccountPolicy {
     roles: Vec<String>,
     attributes: Vec<(String, String)>,
     allowlist: Vec<String>,
+    role_endpoints: BTreeMap<String, Vec<String>>,
+    role_params: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +269,11 @@ impl TenantDirectory {
             let mut attributes = account.attributes;
             attributes.sort();
             if attributes.iter().any(|(key, value)| {
-                !ident(key) || value.is_empty() || !printable_ascii(value) || key == "secret"
+                !ident(key)
+                    || value.is_empty()
+                    || value.len() > 256
+                    || !printable_ascii(value)
+                    || credential_name(key)
             }) {
                 return Err(IpcError::Malformed);
             }
@@ -230,12 +288,40 @@ impl TenantDirectory {
             for endpoint in &account.allowlist {
                 strict_service_target(endpoint)?;
             }
+            let mut permissions = account.role_endpoints;
+            let parameters = account.role_params;
+            if parameters.iter().any(|(role, names)| {
+                !roles.contains(role)
+                    || names.len() > 16
+                    || names
+                        .iter()
+                        .any(|name| !ident(name) || credential_name(name))
+            }) {
+                return Err(IpcError::Malformed);
+            }
+            if permissions.is_empty() && roles.len() == 1 {
+                permissions.insert(roles[0].clone(), account.allowlist.clone());
+            }
+            if permissions.len() != roles.len()
+                || roles.iter().any(|role| {
+                    permissions.get(role).is_none_or(|endpoints| {
+                        endpoints.is_empty()
+                            || endpoints
+                                .iter()
+                                .any(|endpoint| !account.allowlist.contains(endpoint))
+                    })
+                })
+            {
+                return Err(IpcError::Malformed);
+            }
             map.insert(
                 account.id,
                 AccountPolicy {
                     roles,
                     attributes,
                     allowlist: account.allowlist,
+                    role_endpoints: permissions,
+                    role_params: parameters,
                 },
             );
         }
@@ -265,9 +351,10 @@ impl TenantDirectory {
         {
             return Err(IpcError::Malformed);
         }
-        let mac = tenant_mac(secret, service_account_id, role, expires_unix_ms)?;
+        let policy = account_fingerprint(account)?;
+        let mac = tenant_mac(secret, service_account_id, role, expires_unix_ms, &policy)?;
         let header = format!(
-            "sa={service_account_id},role={role},exp={expires_unix_ms},v1={}",
+            "sa={service_account_id},role={role},exp={expires_unix_ms},policy={policy},v1={}",
             hex_encode(mac.unprotected_as_ref())
         );
         drop(mac);
@@ -283,12 +370,22 @@ impl TenantDirectory {
         presented_attributes: &[(String, String)],
         now_unix_ms: u64,
     ) -> Result<TenantGrant, IpcError> {
+        if token.len() > 512 {
+            return Err(IpcError::TargetDenied);
+        }
         strict_service_target(endpoint)?;
-        let (account_id, role, expires) = parse_token(token)?;
+        let (account_id, role, expires, policy) = parse_token(token)?;
         if account_id != asserted_account {
             return Err(IpcError::TargetDenied);
         }
-        let expected = tenant_mac(secret, &account_id, &role, expires)?;
+        let account = self
+            .accounts
+            .get(&account_id)
+            .ok_or(IpcError::TargetDenied)?;
+        if policy != account_fingerprint(account)? {
+            return Err(IpcError::TargetDenied);
+        }
+        let expected = tenant_mac(secret, &account_id, &role, expires, &policy)?;
         let presented = decode_mac(token)?;
         let mac_ok = bool::from(presented.ct_eq(expected.unprotected_as_ref()));
         drop(expected);
@@ -305,6 +402,10 @@ impl TenantDirectory {
         presented_sorted.sort();
         if presented_sorted != account.attributes
             || !account.allowlist.iter().any(|item| item == endpoint)
+            || !account
+                .role_endpoints
+                .get(&role)
+                .is_some_and(|items| items.iter().any(|item| item == endpoint))
         {
             return Err(IpcError::TargetDenied);
         }
@@ -314,10 +415,50 @@ impl TenantDirectory {
             endpoint: endpoint.to_string(),
         })
     }
+
+    pub(crate) fn account_attributes(&self, account: &str) -> Option<&[(String, String)]> {
+        self.accounts
+            .get(account)
+            .map(|policy| policy.attributes.as_slice())
+    }
+
+    pub(crate) fn allowed_params(&self, account: &str, role: &str) -> Option<&[String]> {
+        let account = self.accounts.get(account)?;
+        Some(
+            account
+                .role_params
+                .get(role)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+    }
+}
+
+pub(crate) fn credential_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "api_key"
+            | "apikey"
+            | "access_token"
+            | "authorization"
+            | "credential"
+            | "endpoint"
+            | "listen"
+            | "password"
+            | "private_key"
+            | "secret"
+            | "token"
+            | "url"
+    )
+}
+
+fn account_fingerprint(account: &AccountPolicy) -> Result<String, IpcError> {
+    let bytes = serde_json::to_vec(account).map_err(|_| IpcError::Malformed)?;
+    Ok(hex_encode(&Sha256::digest(&bytes)))
 }
 
 #[derive(Debug)]
-pub struct SharedIdempotency {
+pub struct ReferenceIdempotency {
     cap: usize,
     fence: AtomicU64,
     state: Mutex<StoreState>,
@@ -368,7 +509,7 @@ enum Claim {
     Full,
 }
 
-impl SharedIdempotency {
+impl ReferenceIdempotency {
     pub fn new(cap: usize) -> Result<Self, IpcError> {
         if cap == 0 {
             return Err(IpcError::Malformed);
@@ -462,7 +603,7 @@ impl SharedIdempotency {
         Claim::Leader(fence)
     }
 
-    fn commit_done(&self, call: &ClusterCall, fence: u64, transport_status: u16) -> bool {
+    fn commit_done(&self, call: &ReferenceCall, fence: u64, transport_status: u16) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         let map_key = store_key(&call.service_account_id, &call.idempotency_key);
         let pending = matches!(
@@ -489,7 +630,7 @@ impl SharedIdempotency {
         true
     }
 
-    fn commit_inconclusive(&self, call: &ClusterCall, fence: u64) -> bool {
+    fn commit_inconclusive(&self, call: &ReferenceCall, fence: u64) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         let map_key = store_key(&call.service_account_id, &call.idempotency_key);
         let pending = matches!(
@@ -517,7 +658,7 @@ impl SharedIdempotency {
 }
 
 #[derive(Debug, Clone)]
-pub struct ClusterCall {
+pub struct ReferenceCall {
     pub service_account_id: String,
     pub endpoint: String,
     pub payload_hash: String,
@@ -526,28 +667,28 @@ pub struct ClusterCall {
     pub seal_report: String,
 }
 
-pub struct ClusterNode {
-    store: Arc<SharedIdempotency>,
+pub struct ReferenceClusterNode {
+    store: Arc<ReferenceIdempotency>,
     provider_hits: Arc<AtomicUsize>,
 }
 
-impl ClusterNode {
-    pub fn new(store: Arc<SharedIdempotency>, provider_hits: Arc<AtomicUsize>) -> Self {
+impl ReferenceClusterNode {
+    pub fn new(store: Arc<ReferenceIdempotency>, provider_hits: Arc<AtomicUsize>) -> Self {
         Self {
             store,
             provider_hits,
         }
     }
 
-    pub fn execute(&self, call: &ClusterCall) -> Result<SharedReceipt, IpcError> {
+    pub fn execute(&self, call: &ReferenceCall) -> Result<SharedReceipt, IpcError> {
         self.finish(call, false)
     }
 
-    pub fn execute_interrupted(&self, call: &ClusterCall) -> Result<SharedReceipt, IpcError> {
+    pub fn execute_interrupted(&self, call: &ReferenceCall) -> Result<SharedReceipt, IpcError> {
         self.finish(call, true)
     }
 
-    fn finish(&self, call: &ClusterCall, interrupt: bool) -> Result<SharedReceipt, IpcError> {
+    fn finish(&self, call: &ReferenceCall, interrupt: bool) -> Result<SharedReceipt, IpcError> {
         validate_call(call)?;
         match self.store.claim(
             &call.service_account_id,
@@ -585,6 +726,10 @@ pub struct WorkerPermit<'a> {
     gate: &'a WorkerGate,
 }
 
+pub struct OwnedWorkerPermit {
+    gate: Arc<WorkerGate>,
+}
+
 impl WorkerGate {
     pub fn new() -> Self {
         Self {
@@ -593,6 +738,18 @@ impl WorkerGate {
     }
 
     pub fn try_acquire(&self) -> Result<WorkerPermit<'_>, IpcError> {
+        self.acquire_slot()?;
+        Ok(WorkerPermit { gate: self })
+    }
+
+    pub fn try_acquire_owned(self: &Arc<Self>) -> Result<OwnedWorkerPermit, IpcError> {
+        self.acquire_slot()?;
+        Ok(OwnedWorkerPermit {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn acquire_slot(&self) -> Result<(), IpcError> {
         loop {
             let current = self.inflight.load(Ordering::SeqCst);
             if current >= WORKER_CAP {
@@ -605,7 +762,7 @@ impl WorkerGate {
                 .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return Ok(WorkerPermit { gate: self });
+                return Ok(());
             }
         }
     }
@@ -623,8 +780,14 @@ impl Drop for WorkerPermit<'_> {
     }
 }
 
+impl Drop for OwnedWorkerPermit {
+    fn drop(&mut self) {
+        self.gate.inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn shared_receipt(
-    call: &ClusterCall,
+    call: &ReferenceCall,
     transport_status: u16,
     duplicate_status: Option<u16>,
 ) -> SharedReceipt {
@@ -640,7 +803,7 @@ fn shared_receipt(
     }
 }
 
-fn validate_call(call: &ClusterCall) -> Result<(), IpcError> {
+fn validate_call(call: &ReferenceCall) -> Result<(), IpcError> {
     if !ident(&call.service_account_id) || !valid_key(&call.idempotency_key) {
         return Err(IpcError::Malformed);
     }
@@ -666,27 +829,58 @@ fn store_key(account: &str, idempotency_key: &str) -> String {
     format!("{account}\u{1f}{idempotency_key}")
 }
 
-fn canonical_event(event: &AuditEvent) -> Result<String, IpcError> {
+fn canonical_event(event: &AuditEvent, key: &[u8]) -> Result<String, IpcError> {
     if !ident(&event.service_account_id)
         || !printable_ascii(&event.endpoint)
         || !printable_ascii(&event.payload_hash)
         || !printable_ascii(&event.idempotency_key)
         || !printable_ascii(&event.seal_report)
         || !printable_ascii(&event.binding_digest_hex)
+        || [
+            &event.endpoint,
+            &event.payload_hash,
+            &event.idempotency_key,
+            &event.seal_report,
+            &event.binding_digest_hex,
+        ]
+        .iter()
+        .any(|field| field.len() > 2048)
     {
         return Err(IpcError::Malformed);
     }
     Ok(format!(
         "{{\"binding_digest_hex\":{},\"endpoint\":{},\"idempotency_key\":{},\"kind\":{},\"payload_hash\":{},\"seal_report\":{},\"service_account_id\":{},\"transport_status\":{}}}",
-        json_string(&event.binding_digest_hex),
-        json_string(&event.endpoint),
-        json_string(&event.idempotency_key),
+        json_string(&audit_ref(
+            key,
+            "binding_digest_hex",
+            &event.binding_digest_hex
+        )?),
+        json_string(&audit_ref(key, "endpoint", &event.endpoint)?),
+        json_string(&audit_ref(key, "idempotency_key", &event.idempotency_key)?),
         json_string(event.kind.label()),
-        json_string(&event.payload_hash),
-        json_string(&event.seal_report),
-        json_string(&event.service_account_id),
+        json_string(&audit_ref(key, "payload_hash", &event.payload_hash)?),
+        json_string(&audit_ref(key, "seal_report", &event.seal_report)?),
+        json_string(&audit_ref(
+            key,
+            "service_account_id",
+            &event.service_account_id
+        )?),
         event.transport_status
     ))
+}
+
+fn audit_ref(key: &[u8], field: &str, value: &str) -> Result<String, IpcError> {
+    let mut mac = keyed_mac(key)?;
+    for bytes in [
+        b"nexus-audit-field-v2\0".as_slice(),
+        field.as_bytes(),
+        b"\0".as_slice(),
+        value.as_bytes(),
+    ] {
+        mac.update(bytes).map_err(|_| IpcError::Malformed)?;
+    }
+    let tag = mac.finalize().map_err(|_| IpcError::Malformed)?;
+    Ok(format!("hmac256:{}", hex_encode(tag.unprotected_as_ref())))
 }
 
 fn json_string(value: &str) -> String {
@@ -743,90 +937,119 @@ fn merkle_pair(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-pub fn verify_export(exported: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(exported) else {
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditExport {
+    schema: String,
+    head: String,
+    merkle_root: String,
+    records: Vec<ExportRecord>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportRecord {
+    sequence: u64,
+    previous: String,
+    link: String,
+    event: ExportEvent,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportEvent {
+    kind: String,
+    service_account_id: String,
+    endpoint: String,
+    payload_hash: String,
+    idempotency_key: String,
+    seal_report: String,
+    binding_digest_hex: String,
+    transport_status: u16,
+}
+
+/// Verify both strict schema integrity and an independently trusted checkpoint.
+/// serde's structs reject duplicate as well as unknown fields.
+pub fn verify_export(exported: &str, trusted: &AuditCheckpoint) -> bool {
+    if exported.len() > AUDIT_EXPORT_MAX {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<AuditExport>(exported) else {
         return false;
     };
-    let Some(records) = value.get("records").and_then(|item| item.as_array()) else {
+    if value.schema != "nexus-audit-v2"
+        || value.records.len() > AUDIT_CAPACITY
+        || trusted.records != value.records.len() as u64
+    {
         return false;
-    };
+    }
     let mut previous = [0; 32];
-    let mut links = Vec::new();
-    for (index, record) in records.iter().enumerate() {
-        let Some(sequence) = record.get("sequence").and_then(|item| item.as_u64()) else {
-            return false;
-        };
-        let Some(expected) = u64::try_from(index)
-            .ok()
-            .and_then(|item| item.checked_add(1))
-        else {
-            return false;
-        };
-        if sequence != expected {
+    let mut links = Vec::with_capacity(value.records.len());
+    for (index, record) in value.records.iter().enumerate() {
+        if record.sequence != index as u64 + 1 {
             return false;
         }
-        let Some(stored_previous) = record
-            .get("previous")
-            .and_then(|item| item.as_str())
-            .and_then(decode_hex_array)
-        else {
+        let Some(stored_previous) = decode_hex_array(&record.previous) else {
             return false;
         };
-        let Some(stored_link) = record
-            .get("link")
-            .and_then(|item| item.as_str())
-            .and_then(decode_hex_array)
-        else {
+        let Some(stored_link) = decode_hex_array(&record.link) else {
             return false;
         };
-        let Some(event) = record.get("event").and_then(event_from_json) else {
-            return false;
-        };
-        let Ok(encoded) = canonical_event(&event) else {
+        let Some(encoded) = stored_event(&record.event) else {
             return false;
         };
         if stored_previous != previous
-            || stored_link != chain_link(&previous, sequence, encoded.as_bytes())
+            || stored_link != chain_link(&previous, record.sequence, encoded.as_bytes())
         {
             return false;
         }
         previous = stored_link;
         links.push(stored_link);
     }
-    let Some(head) = value
-        .get("head")
-        .and_then(|item| item.as_str())
-        .and_then(decode_hex_array)
-    else {
+    let Some(head) = decode_hex_array(&value.head) else {
         return false;
     };
-    let Some(root) = value
-        .get("merkle_root")
-        .and_then(|item| item.as_str())
-        .and_then(decode_hex_array)
-    else {
+    let Some(root) = decode_hex_array(&value.merkle_root) else {
         return false;
     };
-    head == previous && root == merkle_root(&links)
+    head == previous
+        && root == merkle_root(&links)
+        && head == trusted.head
+        && root == trusted.merkle_root
 }
 
-fn event_from_json(value: &serde_json::Value) -> Option<AuditEvent> {
-    let kind = AuditKind::parse(value.get("kind")?.as_str()?)?;
-    let transport = u16::try_from(value.get("transport_status")?.as_u64()?).ok()?;
-    Some(AuditEvent {
-        kind,
-        service_account_id: value.get("service_account_id")?.as_str()?.to_string(),
-        endpoint: value.get("endpoint")?.as_str()?.to_string(),
-        payload_hash: value.get("payload_hash")?.as_str()?.to_string(),
-        idempotency_key: value.get("idempotency_key")?.as_str()?.to_string(),
-        seal_report: value.get("seal_report")?.as_str()?.to_string(),
-        binding_digest_hex: value.get("binding_digest_hex")?.as_str()?.to_string(),
-        transport_status: transport,
-    })
+fn stored_event(event: &ExportEvent) -> Option<String> {
+    let kind = AuditKind::parse(&event.kind)?;
+    for value in [
+        &event.service_account_id,
+        &event.endpoint,
+        &event.payload_hash,
+        &event.idempotency_key,
+        &event.seal_report,
+        &event.binding_digest_hex,
+    ] {
+        let digest = value.strip_prefix("hmac256:")?;
+        decode_hex_array(digest)?;
+    }
+    Some(format!(
+        "{{\"binding_digest_hex\":{},\"endpoint\":{},\"idempotency_key\":{},\"kind\":{},\"payload_hash\":{},\"seal_report\":{},\"service_account_id\":{},\"transport_status\":{}}}",
+        json_string(&event.binding_digest_hex),
+        json_string(&event.endpoint),
+        json_string(&event.idempotency_key),
+        json_string(kind.label()),
+        json_string(&event.payload_hash),
+        json_string(&event.seal_report),
+        json_string(&event.service_account_id),
+        event.transport_status
+    ))
 }
 
 fn decode_hex_array(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return None;
     }
     let mut out = [0; 32];
@@ -844,6 +1067,7 @@ fn tenant_mac(
     service_account_id: &str,
     role: &str,
     expires_unix_ms: u64,
+    policy: &str,
 ) -> Result<HmacTag, IpcError> {
     if secret.is_empty() || secret.len() > SECRET_MAX {
         return Err(IpcError::Malformed);
@@ -854,7 +1078,11 @@ fn tenant_mac(
     mac.update(b"tenant-v1").map_err(|_| IpcError::Malformed)?;
     mac.update(&expires_unix_ms.to_le_bytes())
         .map_err(|_| IpcError::Malformed)?;
-    for field in [service_account_id.as_bytes(), role.as_bytes()] {
+    for field in [
+        service_account_id.as_bytes(),
+        role.as_bytes(),
+        policy.as_bytes(),
+    ] {
         mac.update(&(field.len() as u64).to_le_bytes())
             .map_err(|_| IpcError::Malformed)?;
         mac.update(field).map_err(|_| IpcError::Malformed)?;
@@ -880,11 +1108,12 @@ fn keyed_mac(key: &[u8]) -> Result<HmacSha256, IpcError> {
     Ok(HmacSha256::new(&guarded))
 }
 
-fn parse_token(token: &str) -> Result<(String, String, u64), IpcError> {
+fn parse_token(token: &str) -> Result<(String, String, u64, String), IpcError> {
     let mut account = None;
     let mut role = None;
     let mut expires = None;
     let mut mac = None;
+    let mut policy = None;
     for part in token.split(',') {
         if let Some(value) = part.strip_prefix("sa=") {
             if account.is_some() || !ident(value) {
@@ -901,6 +1130,11 @@ fn parse_token(token: &str) -> Result<(String, String, u64), IpcError> {
                 return Err(IpcError::Malformed);
             }
             expires = Some(value.parse::<u64>().map_err(|_| IpcError::Malformed)?);
+        } else if let Some(value) = part.strip_prefix("policy=") {
+            if policy.is_some() || decode_hex_array(value).is_none() {
+                return Err(IpcError::Malformed);
+            }
+            policy = Some(value.to_string());
         } else if let Some(value) = part.strip_prefix("v1=") {
             if mac.is_some()
                 || value.len() != 64
@@ -913,13 +1147,15 @@ fn parse_token(token: &str) -> Result<(String, String, u64), IpcError> {
             return Err(IpcError::Malformed);
         }
     }
-    if account.is_none() || role.is_none() || expires.is_none() || mac.is_none() {
+    if account.is_none() || role.is_none() || expires.is_none() || mac.is_none() || policy.is_none()
+    {
         return Err(IpcError::Malformed);
     }
     Ok((
         account.expect("account checked"),
         role.expect("role checked"),
         expires.expect("expiry checked"),
+        policy.expect("policy checked"),
     ))
 }
 
@@ -990,15 +1226,19 @@ mod tests {
 
     #[test]
     fn empty_merkle_root_is_stable() {
+        let _guard = crate::apoptosis::test_serial();
+        crate::apoptosis::reset_coordinator_for_tests();
         let root = merkle_root(&[]);
         let digest: [u8; 32] = Sha256::digest(b"nexus-merkle-empty-v1").into();
         assert_eq!(hex_encode(&root), hex_encode(&digest));
-        assert!(AuditLedger::new().verify());
+        assert!(AuditLedger::try_new().expect("audit admission").verify());
     }
 
     #[test]
     fn mutated_event_breaks_the_chain_and_the_export() {
-        let mut ledger = AuditLedger::new();
+        let _guard = crate::apoptosis::test_serial();
+        crate::apoptosis::reset_coordinator_for_tests();
+        let mut ledger = AuditLedger::try_new().expect("audit admission");
         ledger
             .append(&AuditEvent {
                 kind: AuditKind::Retained,
@@ -1013,11 +1253,12 @@ mod tests {
             .expect("append");
         assert!(ledger.verify());
         let exported = ledger.export_json();
-        assert!(verify_export(&exported));
+        assert!(verify_export(&exported, &ledger.checkpoint()));
         ledger.records[0].event.push('x');
         assert!(!ledger.verify());
+        let checkpoint = ledger.checkpoint();
         let mut tampered = exported;
-        tampered = tampered.replacen("hash-a", "hash-b", 1);
-        assert!(!verify_export(&tampered));
+        tampered = tampered.replacen("retained", "receipt", 1);
+        assert!(!verify_export(&tampered, &checkpoint));
     }
 }

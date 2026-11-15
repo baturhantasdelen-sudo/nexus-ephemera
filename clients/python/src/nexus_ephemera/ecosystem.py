@@ -3,7 +3,7 @@
 MCP, LangChain, Portkey, CrewAI, Composio, and Activepieces all enter through
 one guard. The tool name selects an operator route. Call parameters cannot
 replace that route or carry a provider credential. The daemon allowlist and
-HMAC still run on ``NexusClient.execute``. This module does not sign, does
+HMAC still run on the enterprise payload execution path. This module does not sign, does
 not hold the key, and does not treat the binding digest as a MAC or as mTLS.
 
 A repeated key returns the broker's cached receipt. ``duplicate_status`` is
@@ -19,17 +19,21 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from .errors import (
+    CleanupIncomplete,
+    IpcError,
     IdempotencyConflict,
+    IdempotencyUnavailable,
     Malformed,
     PayloadTooLarge,
     ProtocolError,
     TargetDenied,
+    RateLimited,
 )
-from .framing import valid_idempotency_key
+from .framing import valid_idempotency_key, json_depth_exceeded
 from .models import HARD_PAYLOAD_CAP, Receipt
 
 _NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
@@ -55,12 +59,12 @@ DUPLICATE_PROVIDER_STATUS = 409
 
 
 class Broker(Protocol):
-    """The subset of ``NexusClient`` these adapters are allowed to call."""
+    """Payload executor contract, normally a tenant-bound ``TenantClient``."""
 
-    async def execute(
-        self, endpoint: str, payload_hash: str, idempotency_key: str
+    async def execute_payload(
+        self, endpoint: str, payload: bytes, idempotency_key: str
     ) -> Receipt:
-        """Ask the local broker to authorize one call."""
+        """Execute these exact bytes through the authenticated broker."""
 
 
 @dataclass(frozen=True)
@@ -129,7 +133,12 @@ class EcosystemGuard:
         broker: Broker,
         routes: Sequence[ToolRoute],
         allowlist: Sequence[str],
+        *,
+        cache_capacity: int = 256,
+        pending_capacity: int = 32,
     ) -> None:
+        if not 1 <= cache_capacity <= 4096 or not 1 <= pending_capacity <= 32:
+            raise ProtocolError("invalid guard resource budget")
         if not isinstance(allowlist, Sequence) or isinstance(allowlist, (str, bytes)):
             raise ProtocolError("allowlist is not a list of endpoints")
         cleaned = tuple(allowlist)
@@ -148,6 +157,10 @@ class EcosystemGuard:
         self._by_endpoint = by_endpoint
         self._allowlist = cleaned
         self._seen: dict[str, tuple[str, str, str]] = {}
+        self._cached: dict[str, ActionReceipt] = {}
+        self._cache_capacity = cache_capacity
+        self._pending_capacity = pending_capacity
+        self._pending = 0
         self._lock = asyncio.Lock()
 
     def tools(self) -> tuple[ToolRoute, ...]:
@@ -167,7 +180,7 @@ class EcosystemGuard:
         params: Mapping[str, object],
         idempotency_key: str,
     ) -> ActionReceipt:
-        """Hash the canonical tool call and return the broker receipt."""
+        """Execute the exact canonical payload remotely and return its receipt."""
 
         if not valid_idempotency_key(idempotency_key):
             raise Malformed()
@@ -181,11 +194,28 @@ class EcosystemGuard:
         if len(raw) > HARD_PAYLOAD_CAP:
             raise PayloadTooLarge(HARD_PAYLOAD_CAP)
         payload_hash = hashlib.sha256(raw).hexdigest()
-        async with self._lock:
-            receipt = await self._broker.execute(
-                route.endpoint, payload_hash, idempotency_key
-            )
-            return self._accept(route.endpoint, payload_hash, idempotency_key, receipt)
+        if self._pending >= self._pending_capacity:
+            raise RateLimited()
+        self._pending += 1
+        try:
+            async with self._lock:
+                cached = self._cached.get(idempotency_key)
+                if cached is not None:
+                    if cached.target_endpoint != route.endpoint or cached.payload_hash != payload_hash:
+                        raise IdempotencyConflict()
+                    if not 200 <= cached.transport_status < 300:
+                        raise ProtocolError("provider returned an unsuccessful status")
+                    return replace(cached, replayed=True, duplicate_status=DUPLICATE_PROVIDER_STATUS)
+                if len(self._cached) >= self._cache_capacity:
+                    raise IdempotencyUnavailable()
+                receipt = await self._broker.execute_payload(route.endpoint, raw, idempotency_key)
+                accepted = self._accept(route.endpoint, payload_hash, idempotency_key, receipt)
+                self._cached[idempotency_key] = accepted
+                if not 200 <= accepted.transport_status < 300:
+                    raise ProtocolError("provider returned an unsuccessful status")
+                return accepted
+        finally:
+            self._pending -= 1
 
     def _accept(
         self,
@@ -198,9 +228,12 @@ class EcosystemGuard:
             receipt["target_endpoint"] != endpoint
             or receipt["payload_hash"] != payload_hash
             or receipt["idempotency_key"] != idempotency_key
-            or receipt["seal_report"] not in {"retained", "complete"}
         ):
             raise IdempotencyConflict()
+        if receipt["seal_report"] in {"partial", "failed"}:
+            raise CleanupIncomplete(receipt)
+        if receipt["seal_report"] not in {"retained", "complete"}:
+            raise Malformed()
         observed = (endpoint, payload_hash, receipt["binding_digest_hex"])
         previous = self._seen.get(idempotency_key)
         if previous is None:
@@ -223,7 +256,7 @@ class EcosystemGuard:
 
 
 class LangChainToolGuard:
-    """Run before a LangChain tool body. The body does not receive a key."""
+    """Execute a remote tool through the broker; never run a second local body."""
 
     def __init__(self, guard: EcosystemGuard) -> None:
         self._guard = guard
@@ -236,6 +269,10 @@ class LangChainToolGuard:
     ) -> ActionReceipt:
         if not isinstance(tool_input, Mapping):
             raise Malformed()
+        return await self._guard.authorize(tool_name, tool_input, idempotency_key)
+
+    async def ainvoke(self, tool_name: str, tool_input: Mapping[str, object], idempotency_key: str) -> ActionReceipt:
+        """Execute through the broker, not a second business body in the agent."""
         return await self._guard.authorize(tool_name, tool_input, idempotency_key)
 
 
@@ -254,10 +291,27 @@ class PortkeyGuardrail:
     ) -> ActionReceipt:
         route = self._guard.route_for_endpoint(url)
         if route is None:
+            body = b""
             raise TargetDenied()
         if not isinstance(body, bytes) or len(body) > HARD_PAYLOAD_CAP:
+            body = b""
             raise PayloadTooLarge(HARD_PAYLOAD_CAP)
-        params = _params_from_canonical(route, body)
+        malformed = False
+        oversized = False
+        params: dict[str, str | int] = {}
+        try:
+            params = _params_from_canonical(route, body)
+        except Malformed:
+            malformed = True
+        except PayloadTooLarge:
+            oversized = True
+        if malformed or oversized:
+            # Do not propagate a decoder/validation traceback holding the body.
+            body = b""
+            params = {}
+            if oversized:
+                raise PayloadTooLarge(_MAX_VALUE_BYTES)
+            raise Malformed()
         return await self._guard.authorize(route.name, params, idempotency_key)
 
 
@@ -339,6 +393,15 @@ async def handle_mcp_message(
         return _rpc_error(rpc_id, -32009, str(exc))
     except (Malformed, PayloadTooLarge) as exc:
         return _rpc_error(rpc_id, -32602, str(exc))
+    except CleanupIncomplete as exc:
+        return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32010,
+            "message": "ipc: cleanup incomplete", "data": {
+                "seal_report": exc.receipt["seal_report"],
+                "transport_status": exc.receipt["transport_status"]}}}
+    except IpcError:
+        return _rpc_error(rpc_id, -32000, "ipc: broker execution failed")
+    except Exception:
+        return _rpc_error(rpc_id, -32603, "ipc: internal execution failure")
     return {
         "jsonrpc": "2.0",
         "id": rpc_id,
@@ -438,11 +501,23 @@ def _param_value(value: object) -> str | int:
 
 
 def _params_from_canonical(route: ToolRoute, body: bytes) -> dict[str, str | int]:
+    if json_depth_exceeded(body):
+        body = b""
+        raise Malformed()
+    invalid = False
+    text = ""
+    parsed: object = None
     try:
         text = body.decode("ascii")
         parsed = cast(object, json.loads(text))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise Malformed() from exc
+    except (UnicodeError, json.JSONDecodeError, RecursionError):
+        invalid = True
+    if invalid:
+        # Raise outside the decoder's exception scope: neither __cause__ nor
+        # __context__ may retain JSONDecodeError.doc or UnicodeError.object.
+        text = ""
+        body = b""
+        raise Malformed()
     if not isinstance(parsed, dict):
         raise Malformed()
     fields = _string_key_map(parsed)

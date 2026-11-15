@@ -11,9 +11,13 @@ claim adapter used by more than one local caller. It is not a network service.
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
+import secrets
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import TracebackType
 
 from .ecosystem import endpoint_is_strict
 from .errors import (
@@ -25,9 +29,13 @@ from .errors import (
     TargetDenied,
 )
 from .framing import valid_idempotency_key
+from .framing import wipe
+from .framing import json_depth_exceeded
 
 WORKER_CAP = 32
 DUPLICATE_PROVIDER_STATUS = 409
+AUDIT_CAPACITY = 1024
+AUDIT_EXPORT_MAX = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -43,11 +51,19 @@ class AuditEvent:
 
 
 @dataclass(frozen=True)
+class AuditCheckpoint:
+    head: bytes
+    merkle_root: bytes
+    records: int
+
+
+@dataclass(frozen=True)
 class ServiceAccount:
     id: str
     roles: tuple[str, ...]
     attributes: tuple[tuple[str, str], ...]
     allowlist: tuple[str, ...]
+    role_endpoints: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,13 +82,19 @@ class AuditLedger:
     """Hash-chained JSON events. Modification breaks ``verify``."""
 
     def __init__(self) -> None:
+        self._key = bytearray(secrets.token_bytes(32))
+        self._closed = False
         self._previous = bytes(32)
         self._events: list[bytes] = []
         self._links: list[bytes] = []
         self._previous_links: list[bytes] = []
 
     def append(self, event: AuditEvent) -> bytes:
-        encoded = canonical_event(event)
+        if self._closed:
+            raise ProtocolError("audit ledger is closed")
+        if len(self._events) >= AUDIT_CAPACITY:
+            raise ProtocolError("audit capacity exhausted")
+        encoded = canonical_event(event, self._key)
         sequence = len(self._events) + 1
         link = chain_link(self._previous, sequence, encoded)
         self._previous_links.append(self._previous)
@@ -95,6 +117,16 @@ class AuditLedger:
     def merkle_root(self) -> bytes:
         return merkle_root(self._links)
 
+    def checkpoint(self) -> AuditCheckpoint:
+        return AuditCheckpoint(self._previous, self.merkle_root(), len(self._events))
+
+    def close(self) -> None:
+        self._closed = True
+        wipe(self._key)
+
+    def __del__(self) -> None:
+        self.close()
+
     def export_json(self) -> str:
         records: list[str] = []
         for index, encoded in enumerate(self._events):
@@ -109,6 +141,7 @@ class AuditLedger:
         body = ",".join(records)
         return (
             "{"
+            '"schema":"nexus-audit-v2",'
             f'"head":"{self._previous.hex()}",'
             f'"merkle_root":"{self.merkle_root().hex()}",'
             f'"records":[{body}]'
@@ -130,6 +163,15 @@ class TenantDirectory:
                 raise Malformed()
             if not account.allowlist or any(not endpoint_is_strict(item) for item in account.allowlist):
                 raise Malformed()
+            permissions = dict(account.role_endpoints)
+            if not permissions and len(account.roles) == 1:
+                permissions[account.roles[0]] = account.allowlist
+            if (len(permissions) != len(account.roles) or set(permissions) != set(account.roles)
+                    or any(not endpoints or any(endpoint not in account.allowlist for endpoint in endpoints)
+                           for endpoints in permissions.values())):
+                raise Malformed()
+            account = ServiceAccount(account.id, tuple(account.roles), tuple(account.attributes),
+                                     tuple(account.allowlist), tuple(permissions.items()))
             stored[account.id] = account
         if not stored:
             raise Malformed()
@@ -149,13 +191,15 @@ class TenantDirectory:
         account = self._accounts.get(service_account_id)
         if account is None or role not in account.roles or endpoint not in account.allowlist:
             raise TargetDenied()
+        if endpoint not in dict(account.role_endpoints).get(role, ()):
+            raise TargetDenied()
         presented = tuple(sorted((key, value) for key, value in (attributes or {}).items()))
         if presented != tuple(sorted(account.attributes)):
             raise TargetDenied()
         return endpoint
 
 
-class SharedStore:
+class ReferenceSharedStore:
     """One lock for every caller. Pending and inconclusive entries do not retry."""
 
     def __init__(self, cap: int = 8) -> None:
@@ -256,9 +300,11 @@ class WorkerGate:
             self._inflight += 1
         return _Permit(self)
 
-    def _release(self) -> None:
+    def _release(self, permit: _Permit) -> None:
         with self._lock:
-            self._inflight -= 1
+            if permit._open:
+                permit._open = False
+                self._inflight -= 1
 
 
 class _Permit:
@@ -267,12 +313,20 @@ class _Permit:
         self._open = True
 
     def release(self) -> None:
-        if self._open:
-            self._open = False
-            self._gate._release()
+        self._gate._release(self)
+
+    def __enter__(self) -> _Permit:
+        return self
+
+    def __exit__(self, kind: type[BaseException] | None, value: BaseException | None,
+                 traceback: TracebackType | None) -> None:
+        self.release()
+
+    def __del__(self) -> None:
+        self.release()
 
 
-def canonical_event(event: AuditEvent) -> bytes:
+def canonical_event(event: AuditEvent, key: bytes | bytearray) -> bytes:
     if event.kind not in {"receipt", "target_denied", "idempotency_conflict", "retained"}:
         raise Malformed()
     if not _ident(event.service_account_id):
@@ -284,23 +338,92 @@ def canonical_event(event: AuditEvent) -> bytes:
         event.seal_report,
         event.binding_digest_hex,
     ):
-        if not _printable(field):
+        if not _printable(field) or len(field) > 2048:
             raise Malformed()
     if isinstance(event.transport_status, bool) or not isinstance(event.transport_status, int):
         raise Malformed()
+    if not 0 <= event.transport_status <= 65535:
+        raise Malformed()
     encoded = (
         "{"
-        f'"binding_digest_hex":{_json(event.binding_digest_hex)},'
-        f'"endpoint":{_json(event.endpoint)},'
-        f'"idempotency_key":{_json(event.idempotency_key)},'
+        f'"binding_digest_hex":{_json(_audit_ref(key, "binding_digest_hex", event.binding_digest_hex))},'
+        f'"endpoint":{_json(_audit_ref(key, "endpoint", event.endpoint))},'
+        f'"idempotency_key":{_json(_audit_ref(key, "idempotency_key", event.idempotency_key))},'
         f'"kind":{_json(event.kind)},'
-        f'"payload_hash":{_json(event.payload_hash)},'
-        f'"seal_report":{_json(event.seal_report)},'
-        f'"service_account_id":{_json(event.service_account_id)},'
+        f'"payload_hash":{_json(_audit_ref(key, "payload_hash", event.payload_hash))},'
+        f'"seal_report":{_json(_audit_ref(key, "seal_report", event.seal_report))},'
+        f'"service_account_id":{_json(_audit_ref(key, "service_account_id", event.service_account_id))},'
         f'"transport_status":{event.transport_status}'
         "}"
     )
     return encoded.encode("ascii")
+
+
+def _audit_ref(key: bytes | bytearray, field: str, value: str) -> str:
+    return "hmac256:" + hmac.new(key,
+        b"nexus-audit-field-v2\0" + field.encode("ascii") + b"\0" + value.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+
+
+def _closed_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate audit field")
+        result[key] = value
+    return result
+
+
+def verify_export(exported: str, trusted: AuditCheckpoint) -> bool:
+    """Require a checkpoint from a separately trusted channel, not the export."""
+    if len(exported) > AUDIT_EXPORT_MAX:
+        return False
+    try:
+        if json_depth_exceeded(exported.encode("utf-8")):
+            return False
+        value = json.loads(exported, object_pairs_hook=_closed_object)
+        if not isinstance(value, dict) or set(value) != {"schema", "head", "merkle_root", "records"}:
+            return False
+        records = value["records"]
+        if value["schema"] != "nexus-audit-v2" or not isinstance(records, list):
+            return False
+        if len(records) > AUDIT_CAPACITY or len(records) != trusted.records:
+            return False
+        previous = bytes(32)
+        links: list[bytes] = []
+        event_fields = {"binding_digest_hex", "endpoint", "idempotency_key", "kind", "payload_hash",
+                        "seal_report", "service_account_id", "transport_status"}
+        for index, record in enumerate(records):
+            if not isinstance(record, dict) or set(record) != {"event", "link", "previous", "sequence"}:
+                return False
+            if type(record["sequence"]) is not int or record["sequence"] != index + 1:
+                return False
+            event = record["event"]
+            if not isinstance(event, dict) or set(event) != event_fields:
+                return False
+            if event["kind"] not in {"receipt", "retained", "target_denied", "idempotency_conflict"}:
+                return False
+            if type(event["transport_status"]) is not int or not 0 <= event["transport_status"] <= 65535:
+                return False
+            for field in event_fields - {"kind", "transport_status"}:
+                item = event[field]
+                if not isinstance(item, str) or len(item) != 72 or not item.startswith("hmac256:"):
+                    return False
+                if any(char not in "0123456789abcdef" for char in item[8:]):
+                    return False
+            encoded = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+            if record["previous"] != previous.hex():
+                return False
+            link = chain_link(previous, index + 1, encoded)
+            if record["link"] != link.hex():
+                return False
+            links.append(link)
+            previous = link
+        root = merkle_root(links)
+        return (value["head"] == previous.hex() and value["merkle_root"] == root.hex()
+                and previous == trusted.head and root == trusted.merkle_root)
+    except (ValueError, TypeError, KeyError, OverflowError, RecursionError, UnicodeError):
+        return False
 
 
 def chain_link(previous: bytes, sequence: int, event: bytes) -> bytes:

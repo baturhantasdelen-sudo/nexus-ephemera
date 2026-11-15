@@ -1,49 +1,57 @@
-# Enterprise runbooks
+# Enterprise deployment and recovery
 
-These procedures cover the enterprise adapters in `nexus_ephemera::enterprise` and `nexus_ephemera.enterprise`. They do not turn the process-local daemon cache into a durable database. The default `nexus-daemon` idempotency cache still dies with the process. Pending and inconclusive entries must not be dispatched again.
+## Mandatory production gate
 
-The audit hash chain and Merkle root show whether an exported log was modified. They are not a MAC, not mTLS, and not protection from a process that can rewrite both the log and the stored root. Keep the Merkle root outside the log host. The binding digest on a receipt is still not a remote authenticator. Tenant HMAC tokens are checked by the Rust verifier with a key derived from the broker secret. The Python directory enforces role and allowlist membership and does not accept that secret.
+Without `--enterprise-config`, nexus-daemon is a local reference provider, not a production HTTP gateway. `ReferenceClusterNode`, `ReferenceIdempotency`, and Python `ReferenceSharedStore` are in-process models. Production execution uses `enterprise_runtime::{TenantAuthority, EnterpriseAdmission, RedisIdempotency, HttpPayloadTransport}`.
 
-Same-user IPC remains an account boundary. It does not isolate every process of that user, and it does not create container-namespace tenant IDs.
+Enterprise requests carry tenant authorization and the actual base64 payload. The server recomputes the hash, checks the current policy-bound token, role/action, exact endpoint and parameter allowlist, then claims idempotency before external effects. Legacy hash-only calls cannot bypass this gate. Client filters are supplementary. Verified HTTPS forwards the exact validated bytes; redirects and environment proxies are disabled. Private DER roots never disable certificate/hostname verification. The actual HTTP status is preserved.
 
-## Emergency: stop dispatch
+## Operator configuration
 
-1. Stop new client traffic at the operator edge.
-2. Call `SharedIdempotency::quarantine_for_rotation` (Python: `SharedStore.quarantine_for_rotation`). Further claims fail closed and do not reach the provider.
-3. Export `AuditLedger::export_json` and record `merkle_root` in a separate store. A later `verify_export` that fails means the export was modified.
-4. Do not delete Pending or Inconclusive slots to "unblock" a retry. Those slots exist because the provider outcome is unknown.
+Use a dedicated service account and private configuration/checkpoint directories. Unix socket directories require owner service UID and 0700; sockets require 0600. Apply equivalent service-only Windows ACLs. Broker keys enter via stdin, never argv/config/logs. Scoped tenant bearer tokens also require credential protection.
 
-## Key rotation
+Example enterprise.json (public fixtures; substitute endpoints/paths):
 
-1. Quarantine the shared store. Do not reuse it under the new secret. Cached receipts belong to the old key.
-2. Stop `nexus-daemon`. The old secret is only in that process's stdin and is wiped on shutdown of the broker admission.
-3. Start a new daemon with the new secret on stdin, not argv. Old tenant tokens fail verification.
-4. Issue new tenant tokens from the new process. Token lifetime is at most 24 hours.
-5. Open a new shared store. Replaying an old idempotency key against a wiped store would be a new provider call, so operators must reconcile inconclusive keys before issuing those keys again.
-
-## Failover
-
-1. A second `ClusterNode` uses the same `SharedIdempotency` value.
-2. The node that wins `claim` is the only one allowed to commit with that fence.
-3. If the leader stops after the claim and before commit, the slot stays Pending. The standby receives `Inconclusive` and must not call the provider.
-4. A finished call returns the cached receipt. `duplicate_status` is 409 and `transport_status` stays the first status. The provider hit counter does not increase.
-5. The Redis adapter command is `SET nexus:idem:<account>:<key> pending NX`. A failed NX means the key is already claimed. Treat that as inconclusive or cached, never as a second dispatch. This tree does not open a Redis connection.
-
-## Saturation and network loss
-
-The worker gate allows 32 in-flight acquisitions. The 33rd fails with the capacity error and does not queue more work. Release a permit before accepting another call.
-
-A provider timeout or reset after a claim commits Inconclusive and does not count a successful provider hit. The same key stays inconclusive. Do not retry it automatically.
-
-## Checks
-
-```text
-cargo test --test chaos_resilience -- --test-threads=1
+```json
+{
+  "accounts": [{
+    "id": "billing", "roles": ["charge", "read"],
+    "attributes": [["region", "eu"]],
+    "allowlist": ["https://provider.example/charge", "https://provider.example/read"],
+    "role_endpoints": {"charge": ["https://provider.example/charge"], "read": ["https://provider.example/read"]},
+    "role_params": {"charge": ["amount"], "read": []}
+  }],
+  "redis_url": "redis://127.0.0.1:6379", "namespace": "billing-generation-1",
+  "capacity": 4096, "checkpoint_path": "/private-anchors/billing-instance-1.json"
+}
 ```
 
-From `clients/python`:
+Start with `--enterprise-config enterprise.json --listen PRIVATE_ENDPOINT --allow https://provider.example/charge --allow https://provider.example/read`. Optional `provider_ca_der` configures a trusted private CA file. To issue a short-lived token, separately invoke `--enterprise-config enterprise.json --issue-tenant-token billing charge 60000` with the same key on stdin. The output is a scoped token, never the broker key. Complete policy fingerprints bind tokens; policy changes invalidate old tokens. Maximum lifetime: 24 hours.
 
-```text
-python -m pytest tests/test_enterprise.py
-python -m mypy --strict
-```
+Redis must use AOF, appendfsync always, and maxmemory-policy noeviction. Only literal loopback addresses or Unix sockets permit plaintext; remote Redis requires verified TLS. Restrict network access and credentials. The implementation requires INFO persistence, CONFIG GET, and its Lua/hash commands. Provision a fresh namespace deliberately with `--provision-store`; never automate bootstrap after data loss. Protect Redis credentials and config files. Redis library credential copies are outside managed LockedBuffer guarantees.
+
+## Durable claims and failover
+
+Atomic Lua claims/commits use a bounded Redis hash, tenant-scoped keys, endpoint/body fingerprints and commit fences. Claim/reconnect never silently recreates a missing namespace. Pending, Inconclusive and Done records never expire or evict automatically. A full store rejects work. Reconcile and rotate a drained generation rather than deleting uncertainty.
+
+1. One leader claims before provider dispatch. Competitors receive a cached receipt or Inconclusive, never a second dispatch grant.
+2. Timeout, cancellation, crash or missing commit leaves Pending/Inconclusive. Do not retry under a new business key.
+3. Cached receipts preserve real provider and cleanup statuses. Partial/Failed remain errors. Failure to persist the completion audit creates a cached Partial and closes that admission instance.
+4. Reconcile uncertain keys against authoritative provider records and the tenant-scoped provider idempotency key.
+5. AOF is not consensus or exactly-once across disk loss/asynchronous replica failover. Require provider-native idempotency and a documented no-data-loss failover policy. Do not promote stale replicas.
+
+Emergency stop: stop ingress, call `RedisIdempotency::quarantine_for_rotation`, drain active workers, reconcile uncertainty, then rotate keys/namespaces. Quarantine stops new claims; it does not cancel accepted remote operations. Never delete Pending/Inconclusive merely to unblock retries.
+
+## Audit integrity
+
+Audit v2 uses a strict bounded schema, hash chain and Merkle root. Metadata is domain-separated HMAC references under a random ledger key, not raw endpoints/account IDs/idempotency keys/plaintext hashes. Rust stores that key in managed locked memory. Python helpers do not promise a locked Python heap. `verify_export(export, trusted_checkpoint)` requires an independently trusted head/root/count. Unknown/duplicate fields, rewrite and truncation are rejected. A root solely supplied by the export is insufficient.
+
+The ledger allows 1024 records and rejects appends after close. `FileCheckpointSink` fsyncs snapshots and enforces a monotonic stream. Give each daemon instance a unique path: startup rejects an existing anchor rather than overwriting it with an empty stream. Retain export plus checkpoint; crashes between writes are detectable. Unix parent-directory metadata is fsynced. Local files are NOT WORM storage or remote notarization. Production requires a CheckpointSink backed by independently administered append-only/immutable storage and independently authenticated retained checkpoints. Sink failure blocks admission before dispatch; post-dispatch failure is explicit Partial. Rotate a full stream after draining.
+
+## Resource and verification gates
+
+A mandatory 32-slot owned RAII gate bounds server admission; the 33rd is rejected. Python bounds pending callers and cached receipts. Permit release is idempotent and survives unwind/context exit. Provider/Redis timeouts do not prove remote cancellation.
+
+Required checks: fmt, all-feature Clippy with warnings denied, release workspace tests, pytest and strict mypy. The additional enterprise-redis CI job runs actual AOF Redis with separate processes, crash/Pending, fences, cached Partial, conflicts, capacity, quarantine and missing-namespace checks. Ignored backend tests are explicitly selected there; locally skipped tests are not backend proof.
+
+Production acceptance additionally requires real customer/provider retry tests, Redis restart/failover/data-loss drills, independently retained audit anchors and Linux/macOS/Windows evidence for the exact commit. Local test success alone is not enterprise certification. Same-user IPC is an account boundary, not isolation from every same-user process, container namespace or privileged host administrator. Managed-memory guarantees exclude arbitrary Python/TLS/kernel buffers, registers and hardware attacks. Disable exception logging that captures secret local variables.
