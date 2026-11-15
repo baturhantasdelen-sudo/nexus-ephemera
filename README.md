@@ -10,7 +10,7 @@ The library verifies wipe and bounds how long a managed buffer is retained. It d
 | `nexus-ephemera-memlock` | Fail-closed page locks |
 | `nexus-ephemera-ipc-os` | Peer UID, PID, and Windows user SID checks |
 
-Pilot install, the 64 MiB `RLIMIT_MEMLOCK` ceiling, `CleanupIncomplete` retries, and integer metrics are in [docs/operational_guide.md](docs/operational_guide.md). Platform behavior is in [docs/platform_support.md](docs/platform_support.md). Vulnerability reports use the private advisory form described in [SECURITY.md](SECURITY.md).
+Pilot install, the 64 MiB `RLIMIT_MEMLOCK` ceiling, `CleanupIncomplete` retries, and integer metrics are in [docs/operational_guide.md](docs/operational_guide.md). MCP, LangChain, Portkey, CrewAI, Composio, and Activepieces adapters are in [docs/phase4_ecosystem.md](docs/phase4_ecosystem.md). Those adapters call the local broker and do not receive its secret. Enterprise audit, tenant, and shared-claim procedures are in [docs/enterprise_runbooks.md](docs/enterprise_runbooks.md). Platform behavior is in [docs/platform_support.md](docs/platform_support.md). Vulnerability reports use the private advisory form described in [SECURITY.md](SECURITY.md).
 
 ```text
 cargo fmt --all -- --check

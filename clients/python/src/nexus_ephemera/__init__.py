@@ -8,6 +8,21 @@ belong to the same user. Neither check is mTLS.
 """
 
 from .client import NexusClient
+from .ecosystem import (
+    DUPLICATE_PROVIDER_STATUS,
+    ActionReceipt,
+    EcosystemGuard,
+    LangChainToolGuard,
+    PortkeyGuardrail,
+    ProviderEdge,
+    ToolRoute,
+    activepieces_step,
+    canonical_payload,
+    composio_action,
+    crewai_tool_call,
+    endpoint_is_strict,
+    handle_mcp_message,
+)
 from .errors import (
     CleanupIncomplete,
     IpcError,
@@ -42,6 +57,13 @@ __all__ = [
     "HARD_PAYLOAD_CAP",
     "KEY_MAX",
     "PAYLOAD_HASH_MAX",
+    "DUPLICATE_PROVIDER_STATUS",
+    "ActionReceipt",
+    "EcosystemGuard",
+    "LangChainToolGuard",
+    "PortkeyGuardrail",
+    "ProviderEdge",
+    "ToolRoute",
     "CleanupIncomplete",
     "IpcError",
     "IdempotencyConflict",
@@ -59,4 +81,10 @@ __all__ = [
     "Receipt",
     "TargetDenied",
     "TimedOut",
+    "activepieces_step",
+    "canonical_payload",
+    "composio_action",
+    "crewai_tool_call",
+    "endpoint_is_strict",
+    "handle_mcp_message",
 ]

@@ -1,0 +1,59 @@
+Nexus Ephemera — Aşama 4 ekosistem doğrulaması
+Tarih: 2026-11-15
+Konak: Windows (win32)
+Taban: yerel çalışma ağacı, commit edilmedi.
+
+Adaptörler `nexus_ephemera.ecosystem` içindedir. Hiçbiri broker sırrını almaz.
+Araç adı operatör rotasını seçer. Çağrı parametreleri uç noktayı veya kimlik
+bilgisini değiştiremez. HMAC daemon'da kalır. Binding digest bir MAC değildir
+ve mTLS değildir.
+
+1. MCP
+tests/ecosystem_mcp_receipt.rs
+mcp_tool_call_receipt_is_retained_and_replay_does_not_dispatch: geçti.
+- Kanonik araç yükünün SHA-256 özeti broker'a gitti.
+- İlk çağrı SealReport::Retained, transport 204. Daemon HMAC başlığı
+  verify_request_header ile doğrulandı. İmza, binding digest'ten ayrı.
+- Aynı anahtarın tekrarı önbellek makbuzunu döndürdü. Dispatch sayacı 1'de kaldı.
+- Aynı anahtar ve farklı özet IdempotencyConflict. Dispatch sayacı 1'de kaldı.
+- evil, sorgu ve fragment uçları TargetDenied. Dispatch sayacı 1'de kaldı.
+
+clients/python/tests/test_ecosystem.py
+- tools/list broker'ı çağırmaz.
+- tools/call sonucu seal_report=retained ve nexus.seal_report taşır.
+- Aynı MCP çağrısı replayed ve duplicate_status 409 döndürür.
+  transport_status önbellekteki 204 olarak kalır. Broker çağrısı 1,
+  sağlayıcı kabulü 1. Ham ikinci sağlayıcı gönderimi 409.
+- Bilinmeyen araç JSON-RPC -32003. endpoint veya api_key parametresi
+  Malformed; hata metni sırrı ve yabancı konağı yazmaz. Broker çağrısı 0.
+
+2. LangChain ve Portkey
+- LangChainToolGuard.before_invoke retained makbuz döndürür.
+- PortkeyGuardrail.before_request yalnız kayıtlı uç ve kanonik gövdeyi geçirir.
+- evil, ?x=1 ve #frag TargetDenied. Bozuk gövde Malformed.
+  Bu redler execute öncesindedir; broker sayacı artmaz.
+
+3. CrewAI, Composio, Activepieces
+- crewai_tool_call api_key parametresini Malformed ile keser.
+- composio_action ilk makbuzu alır. activepieces_step aynı anahtarla
+  önbellek makbuzunu ve duplicate_status 409 döndürür. Dispatch 1.
+- Aynı anahtar ve değişen amount IdempotencyConflict. Dispatch 1.
+
+4. Kapılar
+cargo fmt --all -- --check: temiz.
+CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --all-features -- -D warnings: temiz.
+RUSTFLAGS="-D warnings" cargo test --workspace --release -- --test-threads=1
+  Sürüm profili 1m 09s. Harness toplamı:
+  lib 73, broker_transaction 1, ecosystem_mcp_receipt 1, forensic_residue 1,
+  ipc_isolation 7, pilot_daemon_smoke 3, pipeline_integration 1,
+  reference_flow 2, reference_verifier 2, ipc_os 3, memlock 11.
+  Toplam 105 passed, 0 failed. linux_fork_probe çıkış kodu 0.
+python -m mypy --strict: 10 kaynak, sorun yok.
+python -m pytest -q: 35 passed, 2 skipped.
+  Atlananlar: tests/test_client.py unix socket;
+  tests/test_pilot_python_sdk.py live pilot (NEXUS_DAEMON_EXE yok).
+  Ekosistem testleri atlanmadı.
+
+Resmi LangChain, Portkey, CrewAI, Composio ve Activepieces paketleri çalışma
+bağımlılığı olarak eklenmedi. Adaptörler onların araç çağrısı şekline uyar ve
+yerel broker'dan başka bir kimlik taşımaz.

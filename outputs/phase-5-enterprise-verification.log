@@ -1,0 +1,55 @@
+Nexus Ephemera — Aşama 5 kurumsal doğrulama
+Tarih: 2026-11-15
+Konak: Windows (win32)
+Durum: yerel çalışma ağacı, commit edilmedi.
+
+Bu katman varsayılan daemon önbelleğinin yerine geçmez. O önbellek süreçle
+birlikte biter. Paylaşımlı claim adaptörü, tenant HMAC ve hash zinciri
+`nexus_ephemera::enterprise` içindedir. Binding digest bir MAC değildir ve
+mTLS değildir. Hash zinciri, kök günlükten ayrı tutulursa değişikliği gösterir.
+Aynı kullanıcı IPC'si konteyner kiracı kimliği değildir.
+
+1. Denetim izi
+- AuditLedger retained, target_denied ve idempotency_conflict olaylarını
+  sıralı JSON olarak yazar.
+- SHA-256 halkası ve Merkle kökü verify ve verify_export ile doğrulanır.
+- Değiştirilmiş olay veya export doğrulamayı bozar.
+- Export broker sırrını içermez.
+
+2. Kiracı ve RBAC
+- TenantDirectory hesap, rol, öznitelik ve allowlist ile kurulur.
+- issue_token HMAC üretir. authorize yanlış hesap, başka hesabın ucu,
+  sorgu dizesi ve bozuk MAC için TargetDenied döner. Sağlayıcı sayacı artmaz.
+- Python dizini sırrı almaz; rol ve allowlist uyuşmazlığını çağrıdan önce keser.
+
+3. Paylaşımlı idempotency
+- İki çağıran tek SharedIdempotency üzerinde yarıştı. Sağlayıcı sayacı 1 kaldı.
+- Sonraki çağrı önbellek makbuzunu döndürdü: transport_status 204,
+  seal_report retained, duplicate_status 409.
+- Farklı özet IdempotencyConflict. Sayaç 1.
+- Ağ kesintisi Inconclusive yazar ve ikinci çağrı sağlayıcıya gitmez.
+- Rotasyon karantinası yeni claim'i Protocol ile keser.
+- Redis komutu üretildi: SET nexus:idem:billing:idem-1 pending NX.
+  Bu ağaç bir Redis bağlantısı açmaz.
+
+4. Dayanıklılık
+cargo test --test chaos_resilience -- --test-threads=1
+chaos_resilience_keeps_one_dispatch_and_a_verifiable_log: geçti.
+İşçi kapısı 32. 33. acquire kapasite hatası verir; bir izin bırakılınca yenisi alınır.
+Runbook: docs/enterprise_runbooks.md
+
+5. Kapılar
+cargo fmt --all -- --check: temiz.
+CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --all-features -- -D warnings: temiz.
+RUSTFLAGS="-D warnings" cargo test --workspace --release -- --test-threads=1
+  Sürüm profili 1m 11s. Harness toplamı:
+  lib 75, broker_transaction 1, chaos_resilience 1, ecosystem_mcp_receipt 1,
+  forensic_residue 1, ipc_isolation 7, pilot_daemon_smoke 3,
+  pipeline_integration 1, reference_flow 2, reference_verifier 2,
+  ipc_os 3, memlock 11.
+  Toplam 108 passed, 0 failed. linux_fork_probe çıkış kodu 0.
+python -m mypy --strict: 11 kaynak, sorun yok.
+python -m pytest -q: 40 passed, 2 skipped.
+  Atlananlar: tests/test_client.py unix socket;
+  tests/test_pilot_python_sdk.py live pilot (NEXUS_DAEMON_EXE yok).
+  Kurumsal testler atlanmadı.

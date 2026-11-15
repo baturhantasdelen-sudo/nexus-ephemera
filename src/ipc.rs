@@ -838,7 +838,7 @@ fn resolve_allowlisted_endpoint<'a>(
         .ok_or(IpcError::TargetDenied)
 }
 
-fn strict_service_target(value: &str) -> Result<(), IpcError> {
+pub(crate) fn strict_service_target(value: &str) -> Result<(), IpcError> {
     let host_and_path = value
         .strip_prefix("https://")
         .filter(|rest| !rest.is_empty())

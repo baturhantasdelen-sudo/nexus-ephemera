@@ -8,6 +8,7 @@ pub use apoptosis::WipeStatus;
 pub mod broker;
 pub mod context;
 pub mod crypto;
+pub mod enterprise;
 pub mod exposure;
 pub(crate) mod idempotency;
 pub mod ipc;
