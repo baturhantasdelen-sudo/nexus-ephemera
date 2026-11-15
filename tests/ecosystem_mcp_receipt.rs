@@ -189,7 +189,7 @@ fn unique_listen() -> String {
         let dir = std::env::temp_dir().join(format!("nexus-eco-{pid}"));
         let _ = std::fs::create_dir(&dir);
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        return dir.join("mcp.sock").to_string_lossy().into_owned();
+        dir.join("mcp.sock").to_string_lossy().into_owned()
     }
     #[cfg(windows)]
     {
