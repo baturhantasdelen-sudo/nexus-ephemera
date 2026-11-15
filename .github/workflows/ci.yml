@@ -43,7 +43,10 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
         shell: bash
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee outputs/ci-evidence/clippy.log
+        run: |
+          rustc --version --verbose | tee outputs/ci-evidence/rustc-version.txt
+          cargo clippy --version | tee outputs/ci-evidence/clippy-version.txt
+          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee outputs/ci-evidence/clippy.log
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -107,7 +110,19 @@ jobs:
           mkdir -p outputs/ci-evidence
           git rev-parse HEAD > outputs/ci-evidence/commit.txt
           git status --porcelain > outputs/ci-evidence/worktree.txt
-          python -c "import hashlib,pathlib; p=pathlib.Path('target/release/nexus-daemon'+('.exe' if __import__('sys').platform=='win32' else '')); print(hashlib.sha256(p.read_bytes()).hexdigest(), p)" > outputs/ci-evidence/daemon-sha256.txt
+          python - <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          binary = pathlib.Path('target/release/nexus-daemon' + ('.exe' if sys.platform == 'win32' else ''))
+          evidence = pathlib.Path('outputs/ci-evidence')
+          if binary.is_file():
+              (evidence / 'daemon-sha256.txt').write_text(
+                  hashlib.sha256(binary.read_bytes()).hexdigest() + '  ' + str(binary) + '\n', encoding='utf-8')
+          else:
+              (evidence / 'daemon-not-built.txt').write_text(
+                  'Release daemon was not produced; inspect preceding build/test steps.\n', encoding='utf-8')
+          PY
 
       - name: Upload verification evidence
         if: always()

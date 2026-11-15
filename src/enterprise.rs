@@ -445,7 +445,7 @@ impl SharedIdempotency {
         }
         let Ok(fence) = self
             .fence
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                 value.checked_add(1)
             })
         else {
