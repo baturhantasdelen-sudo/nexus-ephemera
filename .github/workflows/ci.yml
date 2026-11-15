@@ -91,6 +91,13 @@ jobs:
         run: |
           binary="$GITHUB_WORKSPACE/target/release/nexus-daemon"
           if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # Each Actions step has a fresh shell; the Rust step's raised
+            # limit is not inherited here. Match the documented pilot quota.
+            prlimit --pid=$$ --memlock
+            sudo prlimit --pid=$$ --memlock=67108864:67108864
+            prlimit --pid=$$ --memlock
+          fi
           NEXUS_DAEMON_EXE="$binary" python -m pytest tests/test_pilot_python_sdk.py -v --junitxml=../../outputs/ci-evidence/live-python.xml 2>&1 | tee ../../outputs/ci-evidence/live-python.log
 
       - name: Preserve source identity and raw pilot evidence

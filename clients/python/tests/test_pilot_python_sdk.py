@@ -46,7 +46,14 @@ def test_pilot_live_python_to_daemon() -> None:
             process.stdin.write(b"public-test-fixture-secret")
             await process.stdin.drain()
             process.stdin.close()
-            assert await asyncio.wait_for(process.stdout.readline(), 15) == b"ready\n"
+            ready = await asyncio.wait_for(process.stdout.readline(), 15)
+            if ready != b"ready\n":
+                _, stderr = await asyncio.wait_for(process.communicate(), 5)
+                diagnostic = stderr.replace(b"public-test-fixture-secret", b"[REDACTED]")
+                pytest.fail(
+                    f"daemon startup failed (exit={process.returncode}): "
+                    + diagnostic.decode(errors="replace")
+                )
             client = NexusClient(listen, timeout=3)
             first = await client.execute("https://provider.example/charge", "hash", "live-key")
             replay = await client.execute("https://provider.example/charge", "hash", "live-key")
