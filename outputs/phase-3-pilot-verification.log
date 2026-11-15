@@ -1,0 +1,67 @@
+Nexus Ephemera — Aşama 3 pilot doğrulaması
+Tarih: 2026-11-15
+Konak: Windows (win32)
+Taban: e8fc5ea (v0.2.0-sealed). Pilot dosyaları yereldir, commit edilmedi.
+  tests/pilot_daemon_smoke.rs
+  clients/python/tests/pilot_python_sdk.py
+
+1. Daemon ikilisi ve özel uç nokta
+Komut: cargo test --test pilot_daemon_smoke -- --test-threads=1
+Sonuç: 2 passed, 0 failed (debug ve ardından release).
+
+release_daemon_binds_a_private_endpoint_and_denies_foreign_targets
+- nexus-daemon bu testin ikilisi olarak kalktı, stdin sırrını okudu, stdout'a ready yazdı.
+- Windows named pipe: pipe_server_peer aynı kullanıcıyı ve sıfır olmayan PID'yi doğruladı;
+  assert_pipe_dacl_is_current_user_only istemci tutamacında geçti.
+- Unix 0600 soket kolu bu konakta derlenmedi. Aynı test Unix'te soket modunu 0600 bekler.
+- Allowlist çağrısı https://provider.example/charge 204 ve SealReport::Retained döndü.
+  Makbuzda sır yok. stderr peer_ok pid=<test süreci> içeriyor, sırrı içermiyor.
+- Şu uçlar dispatch öncesi IpcError::TargetDenied:
+  https://evil.example/charge
+  https://provider.example/charge?x=1
+  https://provider.example/charge#frag
+  https://provider.example/charge/../admin
+  http://provider.example/charge
+
+signed_loopback_checks_body_route_and_replays_without_a_second_dispatch
+- Döngüsel HTTP/1.1 doğrulayıcı yalnızca 127.0.0.1 ve /charge.
+- Eksik imza: 401.
+- Zaman damgası pencereden 30s geride ve 30s ileride: 401.
+- Pencere içi imza verify_request_header ile kabul; aynı imza +5001 ms ile red.
+- Gövde SHA-256 özeti payload_hash ile uyuşmazsa: 400.
+- /charge?x=1, /charge#frag, /charge/../admin, /v1/charge ve bozuk request-line: 403.
+- İlk /charge: 204. Aynı idempotency anahtarı: 409. accepted sayacı 1'de kaldı.
+- Broker aynı anahtarla ikinci çağrıda önbellek makbuzunu döndürdü.
+  verifier.received artmadı (sağlayıcıya ikinci gidiş yok). accepted 2
+  (doğrudan once-key + broker-key).
+
+2. Python SDK
+Komut (clients/python): python -m pytest -q
+Sonuç: 25 passed, 1 skipped.
+Pilot dosyası tests/pilot_python_sdk.py beş senaryoyu da geçti:
+- 4 bayt little-endian çerçeve; write_frame başlık ve gövdeyi ayrı yazar; wipe gövdeyi sıfırlar.
+- socket.socket olmayan TransportSocket sarmalayıcısı fileno/getsockopt ile peer_socket_ready'den geçer.
+  Nesnesi olmayan değer IdentityUnavailable verir.
+- asyncio.wait_for bütçesi: 30s uyuyan open_broker, timeout 0.05, TimedOut 1s içinde.
+- kind=rejected code=target_denied çerçevesi TargetDenied olarak yüzeye çıkar.
+- Windows: _OVERLAPPED boyutu 32 (64-bit), _MAX_WORKERS 32.
+  32 dolu işçi varken 33. çağrı IoFailure "pending operation capacity exhausted".
+Atlanan test Unix canlı soket senaryosudur; bu konakta çalışmaz.
+Canlı SO_PEERCRED / getpeereid bu Windows oturumunda ölçülmedi.
+
+3. Kapılar
+cargo fmt --all -- --check: temiz.
+CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets -- -D warnings: temiz.
+cargo clippy --workspace --all-targets --all-features -- -D warnings: temiz.
+RUSTFLAGS="-D warnings" cargo test --workspace --release -- --test-threads=1
+  Sürüm profili 6m 57s. Çıktısı olan harness'lar:
+  nexus_ephemera lib 72, broker_transaction 1, forensic_residue 1,
+  ipc_isolation 7, pilot_daemon_smoke 2, pipeline_integration 1,
+  reference_flow 2, reference_verifier 2, ipc_os 3, memlock 11.
+  Toplam 102 passed, 0 failed. İkili ve doc-test harness'ları 0 test.
+  linux_fork_probe Windows'ta hemen başarılı döner; süreç çıkış kodu 0.
+python -m mypy --strict: 9 kaynak, sorun yok (win32, linux, darwin).
+python -m pytest -q: 25 passed, 1 skipped.
+
+Pilot sonucu: üç adım bu Windows oturumunda geçti. Unix 0600 ve SO_PEERCRED
+bu konakta çalıştırılmadı; kod yolları testte duruyor.
