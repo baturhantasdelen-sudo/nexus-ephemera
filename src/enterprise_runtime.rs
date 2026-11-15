@@ -787,6 +787,18 @@ pub struct HttpPayloadTransport {
 }
 impl HttpPayloadTransport {
     pub fn new(timeout: Duration) -> Result<Self, IpcError> {
+        // reqwest's rustls-no-provider never installs a provider implicitly.
+        // A test TLS server can mask this in-process; standalone daemons must
+        // initialize it themselves. Preserve an application-installed provider.
+        // An install race is acceptable only if a provider is now available.
+        if rustls::crypto::CryptoProvider::get_default().is_none()
+            && rustls::crypto::ring::default_provider()
+                .install_default()
+                .is_err()
+            && rustls::crypto::CryptoProvider::get_default().is_none()
+        {
+            return Err(IpcError::Protocol("TLS crypto provider unavailable"));
+        }
         if timeout.is_zero() || timeout > Duration::from_secs(120) {
             return Err(IpcError::Malformed);
         }

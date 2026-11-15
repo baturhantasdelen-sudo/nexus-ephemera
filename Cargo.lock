@@ -766,6 +766,7 @@ dependencies = [
  "rcgen",
  "redis",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
