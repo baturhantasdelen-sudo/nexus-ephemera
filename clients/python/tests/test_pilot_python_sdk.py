@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import os
+from pathlib import Path
 import socket
 import sys
 import threading
+import tempfile
 import time
 
 import pytest
@@ -16,6 +19,51 @@ from nexus_ephemera import transport
 from nexus_ephemera.errors import IdentityUnavailable, IoFailure
 from nexus_ephemera.framing import Stream, read_frame, wipe, write_frame
 from nexus_ephemera.identity import peer_socket_ready
+
+
+def test_pilot_live_python_to_daemon() -> None:
+    """CI must supply the exact binary built by its Rust release test step."""
+    binary = os.environ.get("NEXUS_DAEMON_EXE")
+    if not binary:
+        pytest.skip("live pilot requires NEXUS_DAEMON_EXE")
+    assert Path(binary).is_file(), "configured daemon is missing"
+
+    async def scenario(private: Path) -> None:
+        listen = (
+            rf"\\.\pipe\nexus-python-pilot-{os.getpid()}"
+            if sys.platform == "win32" else str(private / "p.sock")
+        )
+        if sys.platform != "win32":
+            private.chmod(0o700)
+        process = await asyncio.create_subprocess_exec(
+            binary, "--listen", listen, "--allow", "https://provider.example/charge",
+            "--timeout-ms", "2000", "--max-connections", "3",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            assert process.stdin is not None and process.stdout is not None
+            process.stdin.write(b"public-test-fixture-secret")
+            await process.stdin.drain()
+            process.stdin.close()
+            assert await asyncio.wait_for(process.stdout.readline(), 15) == b"ready\n"
+            client = NexusClient(listen, timeout=3)
+            first = await client.execute("https://provider.example/charge", "hash", "live-key")
+            replay = await client.execute("https://provider.example/charge", "hash", "live-key")
+            assert first == replay
+            with pytest.raises(TargetDenied):
+                await client.execute("https://provider.example/charge?x=1", "hash", "denied")
+            _, stderr = await asyncio.wait_for(process.communicate(), 15)
+            assert process.returncode == 0, stderr.decode(errors="replace")
+            assert b"shutdown seal=complete" in stderr
+            assert b"public-test-fixture-secret" not in stderr
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+
+    with tempfile.TemporaryDirectory(prefix="nx-", dir="/tmp" if sys.platform != "win32" else None) as private:
+        asyncio.run(scenario(Path(private)))
 
 
 class _Memory:
@@ -162,5 +210,6 @@ def test_pilot_windows_worker_cap_is_32_and_overlapped_stays_aligned() -> None:
         finally:
             release.set()
             await asyncio.gather(*tasks)
+        assert await _await_worker(lambda: "recovered") == "recovered"
 
     asyncio.run(scenario())

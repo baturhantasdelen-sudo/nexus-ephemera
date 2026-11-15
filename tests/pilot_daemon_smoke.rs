@@ -35,6 +35,8 @@ async fn release_daemon_binds_a_private_endpoint_and_denies_foreign_targets() {
         .arg("1024")
         .arg("--timeout-ms")
         .arg("2000")
+        .arg("--max-connections")
+        .arg("7")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -81,12 +83,13 @@ async fn release_daemon_binds_a_private_endpoint_and_denies_foreign_targets() {
         );
     }
 
-    let _ = child.start_kill();
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
         .expect("daemon exit")
         .expect("wait");
+    assert!(output.status.success(), "daemon shutdown failed");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("shutdown seal=complete"));
     assert!(!stderr.contains("pilot-daemon-secret"));
     assert!(
         stderr.contains(&format!("peer_ok pid={}", std::process::id())),
@@ -248,6 +251,56 @@ async fn signed_loopback_checks_body_route_and_replays_without_a_second_dispatch
     assert_eq!(replay.idempotency_key, receipt.idempotency_key);
     assert_eq!(verifier.received(), before + 1);
     assert_eq!(verifier.accepted(), 2);
+    assert_eq!(
+        daemon.shutdown().expect("explicit cleanup"),
+        SealReport::Complete
+    );
+}
+
+#[tokio::test]
+async fn interrupted_provider_cannot_report_successful_shutdown() {
+    struct Slow(Arc<AtomicBool>);
+    impl SecureTransport for Slow {
+        fn dispatch(&mut self, _: &AuthorizedCall<'_>) -> Result<TransportReply, BrokerError> {
+            self.0.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(150));
+            Ok(TransportReply { status: 204 })
+        }
+    }
+    let entered = Arc::new(AtomicBool::new(false));
+    let listen = unique_listen();
+    let mut secret = SECRET.to_vec();
+    let mut daemon = BrokerDaemon::bind(
+        DaemonConfig {
+            listen: listen.clone(),
+            allowlist: vec![ALLOWED.into()],
+            max_payload_bytes: 1024,
+            timeout: Duration::from_secs(2),
+            idempotency_ttl: Duration::from_secs(60),
+            single_use: false,
+        },
+        &mut secret,
+        Slow(Arc::clone(&entered)),
+    )
+    .await
+    .expect("bind");
+    let client = client_execute(&listen, "hash".into(), "interrupted");
+    {
+        let serving = daemon.serve_one();
+        tokio::pin!(serving);
+        tokio::select! {
+            _ = &mut serving => panic!("provider returned too early"),
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("provider did not start"),
+            () = async {
+                while !entered.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            } => {}
+        }
+    }
+    assert!(matches!(daemon.shutdown(), Err(IpcError::Inconclusive)));
+    assert!(client.await.expect("client task").is_err());
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 async fn assert_endpoint_is_private(listen: &str) {
@@ -281,23 +334,7 @@ async fn assert_endpoint_is_private(listen: &str) {
 }
 
 fn daemon_exe() -> std::path::PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_nexus_daemon") {
-        return std::path::PathBuf::from(path);
-    }
-    let mut path = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
-    path.push(if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    });
-    path.push(if cfg!(windows) {
-        "nexus-daemon.exe"
-    } else {
-        "nexus-daemon"
-    });
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_nexus-daemon"))
 }
 
 fn unique_listen() -> String {

@@ -29,7 +29,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), IpcError> {
     harden_before_secret()?;
-    let config = parse_args(std::env::args().skip(1))?;
+    let (config, max_connections) = parse_args(std::env::args().skip(1))?;
     let mut secret = read_secret(config.timeout)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -44,9 +44,20 @@ fn run() -> Result<(), IpcError> {
     writeln!(stdout, "ready").map_err(IpcError::from)?;
     stdout.flush().map_err(IpcError::from)?;
     drop(stdout);
-    runtime.block_on(async move {
+    let served = runtime.block_on(async {
+        let shutdown = tokio::signal::ctrl_c();
+        tokio::pin!(shutdown);
+        let mut connections = 0u64;
         loop {
-            match daemon.serve_one().await {
+            let outcome = tokio::select! {
+                signal = &mut shutdown => {
+                    signal.map_err(IpcError::from)?;
+                    break Ok(());
+                }
+                result = daemon.serve_one() => result,
+            };
+            connections += 1;
+            match outcome {
                 Ok(nexus_ephemera::ipc::ServedCall::Call { peer_pid, .. })
                 | Ok(nexus_ephemera::ipc::ServedCall::Metrics { peer_pid }) => {
                     eprintln!("peer_ok pid={peer_pid}");
@@ -54,8 +65,21 @@ fn run() -> Result<(), IpcError> {
                 Err(err) if nexus_ephemera::ipc::per_connection(&err) => {}
                 Err(err) => return Err(err),
             }
+            if max_connections.is_some_and(|limit| connections >= limit) {
+                break Ok(());
+            }
         }
-    })
+    });
+    // Always inspect cleanup, including errors and signal cancellation. A
+    // timed-out provider must not be reported as a successful shutdown.
+    let cleanup = daemon.shutdown();
+    let wipe = nexus_ephemera::apoptosis::trigger_apoptosis();
+    cleanup?;
+    if !matches!(wipe, Ok(nexus_ephemera::apoptosis::WipeStatus::Complete)) {
+        return Err(IpcError::Protocol("daemon global cleanup incomplete"));
+    }
+    eprintln!("shutdown seal=complete");
+    served
 }
 
 fn harden_before_secret() -> Result<(), IpcError> {
@@ -236,16 +260,28 @@ fn read_secret_windows(shutdown: &AtomicBool) -> Result<Vec<u8>, IpcError> {
     Ok(secret)
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<DaemonConfig, IpcError> {
+fn parse_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(DaemonConfig, Option<u64>), IpcError> {
     let mut listen = default_listen().to_string();
     let mut allowlist = Vec::new();
     let mut max_payload_bytes = 64 * 1024;
     let mut timeout_ms: u64 = 5_000;
     let mut idempotency_ttl_ms: u64 = 900_000;
     let mut single_use = false;
+    let mut max_connections = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--max-connections" => {
+                let count: u64 = required(&mut args, "--max-connections")?
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid connection limit"))?;
+                if count == 0 {
+                    return Err(IpcError::Protocol("connection limit must be positive"));
+                }
+                max_connections = Some(count);
+            }
             "--listen" => listen = required(&mut args, "--listen")?,
             "--allow" => allowlist.push(required(&mut args, "--allow")?),
             "--max-payload" => {
@@ -266,21 +302,24 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<DaemonConfig, Ip
             "--single-use" => single_use = true,
             "--help" => {
                 println!(
-                    "nexus-daemon --listen PATH --allow ENDPOINT [--allow ENDPOINT] [--max-payload N] [--timeout-ms N] [--idempotency-ttl-ms N] [--single-use]\nkey is read from stdin"
+                    "nexus-daemon --listen PATH --allow ENDPOINT [--allow ENDPOINT] [--max-payload N] [--timeout-ms N] [--idempotency-ttl-ms N] [--single-use] [--max-connections N]\nkey is read from stdin; Ctrl-C requests verified cleanup"
                 );
                 std::process::exit(0);
             }
             _ => return Err(IpcError::Protocol("unknown argument")),
         }
     }
-    Ok(DaemonConfig {
-        listen,
-        allowlist,
-        max_payload_bytes,
-        timeout: Duration::from_millis(timeout_ms),
-        idempotency_ttl: Duration::from_millis(idempotency_ttl_ms),
-        single_use,
-    })
+    Ok((
+        DaemonConfig {
+            listen,
+            allowlist,
+            max_payload_bytes,
+            timeout: Duration::from_millis(timeout_ms),
+            idempotency_ttl: Duration::from_millis(idempotency_ttl_ms),
+            single_use,
+        },
+        max_connections,
+    ))
 }
 
 fn required(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, IpcError> {

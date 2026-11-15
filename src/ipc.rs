@@ -287,6 +287,19 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
         listen(config, agent, transport)
     }
 
+    /// Consume the listener and explicitly verify secret cleanup. An outstanding
+    /// provider is uncertain, even if managed secret cleanup succeeds.
+    pub fn shutdown(mut self) -> Result<crate::broker::SealReport, IpcError> {
+        let seal = self.agent.close();
+        if seal != crate::broker::SealReport::Complete {
+            return Err(IpcError::Protocol("daemon cleanup incomplete"));
+        }
+        if self.dispatch_inbox.is_some() || self.transport.is_none() {
+            return Err(IpcError::Inconclusive);
+        }
+        Ok(seal)
+    }
+
     pub async fn serve_one(&mut self) -> Result<ServedCall, IpcError> {
         let (mut stream, peer_pid) = self.accept().await?;
         let result = self.handle_stream(&mut stream).await;
@@ -830,9 +843,9 @@ fn strict_service_target(value: &str) -> Result<(), IpcError> {
         .strip_prefix("https://")
         .filter(|rest| !rest.is_empty())
         .ok_or(IpcError::TargetDenied)?;
-    let unsafe_byte = value.bytes().any(|byte| {
-        byte.is_ascii_whitespace() || byte < 0x20 || matches!(byte, b'@' | b'#' | b'\\')
-    });
+    let unsafe_byte = value
+        .bytes()
+        .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'@' | b'?' | b'#' | b'%' | b'\\'));
     let dotted = host_and_path
         .split('/')
         .any(|segment| segment == ".." || segment == ".");
@@ -1376,6 +1389,19 @@ mod tests {
                 ),
                 "{rejected}"
             );
+        }
+    }
+
+    #[test]
+    fn unsafe_targets_cannot_be_enabled_by_configuration() {
+        for target in [
+            "https://provider.example/charge?x=1",
+            "https://provider.example/charge#fragment",
+            "https://provider.example/%63harge",
+            "https://provider.example/charge/../admin",
+            "https://provider.example/cha\u{7f}rge",
+        ] {
+            assert!(strict_service_target(target).is_err(), "{target}");
         }
     }
 

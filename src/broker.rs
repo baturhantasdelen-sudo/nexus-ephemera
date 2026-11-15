@@ -374,6 +374,11 @@ impl SecureTransactionAgent {
             .map_err(map_context)
     }
 
+    /// Permanently close this agent and expose cleanup failures to its owner.
+    pub fn close(&mut self) -> SealReport {
+        SealReport::from_status(self.settle_secret())
+    }
+
     fn settle_secret(&mut self) -> AuditStatus {
         self.consumed = true;
         let failed = self.sanitizer.wipe();
