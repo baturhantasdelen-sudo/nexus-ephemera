@@ -22,10 +22,20 @@ use zeroize::{Zeroize, Zeroizing};
 const ALLOWED: &str = "https://provider.example/charge";
 const SECRET: &[u8] = b"pilot-daemon-secret";
 const BODY: &[u8] = b"{\"op\":\"charge\"}";
+const DENIED_TARGETS: [&str; 5] = [
+    "https://evil.example/charge",
+    "https://provider.example/charge?x=1",
+    "https://provider.example/charge#frag",
+    "https://provider.example/charge/../admin",
+    "http://provider.example/charge",
+];
 
 #[tokio::test]
 async fn release_daemon_binds_a_private_endpoint_and_denies_foreign_targets() {
     let listen = unique_listen();
+    // Exactly one endpoint inspection, one successful call, and the denials.
+    // The inspection must consume one connection on every platform.
+    let expected_connections = DENIED_TARGETS.len() + 2;
     let mut child = Command::new(daemon_exe())
         .arg("--listen")
         .arg(&listen)
@@ -36,7 +46,7 @@ async fn release_daemon_binds_a_private_endpoint_and_denies_foreign_targets() {
         .arg("--timeout-ms")
         .arg("2000")
         .arg("--max-connections")
-        .arg("7")
+        .arg(expected_connections.to_string())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -66,13 +76,7 @@ async fn release_daemon_binds_a_private_endpoint_and_denies_foreign_targets() {
     assert_eq!(receipt.target_endpoint, ALLOWED);
     assert!(!receipt.binding_digest_hex.contains("pilot-daemon-secret"));
 
-    for denied in [
-        "https://evil.example/charge",
-        "https://provider.example/charge?x=1",
-        "https://provider.example/charge#frag",
-        "https://provider.example/charge/../admin",
-        "http://provider.example/charge",
-    ] {
+    for denied in DENIED_TARGETS {
         let err = client
             .execute(denied, "pilot-hash", "pilot-deny")
             .await
@@ -310,6 +314,14 @@ async fn assert_endpoint_is_private(listen: &str) {
         let meta = std::fs::metadata(listen).expect("socket metadata");
         assert!(meta.file_type().is_socket(), "listen path is not a socket");
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // Windows inspects a connected pipe handle. Also exercise an actual
+        // authenticated connection on Unix, rather than only stat(), so the
+        // shutdown connection budget is identical on all platforms.
+        NexusClient::new(listen, Duration::from_secs(5), 1024)
+            .expect("inspection client")
+            .metrics()
+            .await
+            .expect("authenticated Unix inspection");
     }
     #[cfg(windows)]
     {
