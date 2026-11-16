@@ -53,6 +53,7 @@ fn peer_policy_and_cleanup_stay_closed() {
 async fn subprocess_allowlist_checks_the_parent_pid() {
     let listen = unique_listen();
     let mut child = Command::new(daemon_exe())
+        .arg("--reference-mode")
         .arg("--listen")
         .arg(&listen)
         .arg("--allow")
@@ -123,6 +124,7 @@ async fn subprocess_allowlist_checks_the_parent_pid() {
 async fn daemon_binds_inside_the_runtime_and_prints_ready() {
     let listen = unique_listen();
     let mut child = Command::new(daemon_exe())
+        .arg("--reference-mode")
         .arg("--listen")
         .arg(&listen)
         .arg("--allow")
@@ -167,6 +169,7 @@ async fn daemon_binds_inside_the_runtime_and_prints_ready() {
 async fn daemon_stdin_timeout_joins_before_ready() {
     let listen = unique_listen();
     let mut child = Command::new(daemon_exe())
+        .arg("--reference-mode")
         .arg("--listen")
         .arg(&listen)
         .arg("--allow")

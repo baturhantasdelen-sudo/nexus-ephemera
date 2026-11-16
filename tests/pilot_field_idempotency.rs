@@ -108,15 +108,17 @@ fn support_account_is_isolated_and_reconciles_without_a_second_provider_write() 
     assert_eq!(failed.creates, 1);
 
     let mut missing = Script::timeout_then_create();
-    let retried = pilot
-        .execute(
-            &mut missing,
-            ask("POST", ISSUES, "Printer jam", "field-retry"),
-            &mut ledger,
-        )
-        .expect("one retry");
-    assert_eq!(retried.duplicate_status, None);
-    assert_eq!(missing.creates, 2);
+    for _ in 0..2 {
+        assert!(matches!(
+            pilot.execute(
+                &mut missing,
+                ask("POST", ISSUES, "Printer jam", "field-retry"),
+                &mut ledger
+            ),
+            Err(IpcError::Inconclusive)
+        ));
+    }
+    assert_eq!(missing.creates, 1);
 
     let mut unknown = Script::timeout_unavailable();
     assert!(matches!(

@@ -39,6 +39,7 @@ async fn release_daemon_binds_a_private_endpoint_and_denies_foreign_targets() {
     let mut child = Command::new(daemon_exe())
         .arg("--listen")
         .arg(&listen)
+        .arg("--reference-mode")
         .arg("--allow")
         .arg(ALLOWED)
         .arg("--max-payload")

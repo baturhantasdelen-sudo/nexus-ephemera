@@ -36,7 +36,7 @@ def test_pilot_live_python_to_daemon() -> None:
         if sys.platform != "win32":
             private.chmod(0o700)
         process = await asyncio.create_subprocess_exec(
-            binary, "--listen", listen, "--allow", "https://provider.example/charge",
+            binary, "--reference-mode", "--listen", listen, "--allow", "https://provider.example/charge",
             "--timeout-ms", "2000", "--max-connections", "3",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

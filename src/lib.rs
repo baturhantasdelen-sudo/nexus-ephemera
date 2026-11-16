@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod enterprise;
 pub mod enterprise_runtime;
 pub mod exposure;
+#[cfg(feature = "reference-pilots")]
 pub mod field;
 pub(crate) mod idempotency;
 pub mod ipc;

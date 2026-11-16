@@ -367,7 +367,7 @@ async def handle_mcp_message(
             "result": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "nexus-ephemera", "version": "0.2.0"},
+                "serverInfo": {"name": "nexus-ephemera", "version": "0.3.0-rc.1"},
             },
         }
     if method == "tools/list":

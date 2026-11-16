@@ -26,6 +26,10 @@ def test_package_schema_health_and_hmac(tmp_path: Path) -> None:
             load_package(tmp_path)
         for name in ("config.toml", ".env", "pilot_support_agent.json", "hmac.key", "policy.hmac"):
             os.chmod(tmp_path / name, stat.S_IRUSR | stat.S_IWUSR)
+    if os.name != "posix":
+        with pytest.raises(ProtocolError):
+            load_package(tmp_path)
+        return
     loaded = load_package(tmp_path)
     assert loaded.allow == "https://api.github.com/repos/pilot-org/support-queue/issues"
     assert "hmac.key" not in repr(loaded)

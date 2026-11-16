@@ -3,7 +3,7 @@ resolver = "2"
 members = [".", "crates/memlock", "crates/ipc_os"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0-rc.1"
 edition = "2024"
 license = "MIT"
 authors = ["Baturhan Taşdelen <baturhantasdelen@gmail.com>"]
@@ -18,8 +18,8 @@ keywords = [
 categories = ["cryptography", "memory-management", "os"]
 
 [workspace.dependencies]
-nexus-ephemera-memlock = { version = "0.2.0", path = "crates/memlock" }
-nexus-ephemera-ipc-os = { version = "0.2.0", path = "crates/ipc_os" }
+nexus-ephemera-memlock = { version = "0.3.0-rc.1", path = "crates/memlock" }
+nexus-ephemera-ipc-os = { version = "0.3.0-rc.1", path = "crates/ipc_os" }
 
 [package]
 rust-version = "1.95"
@@ -72,6 +72,8 @@ nexus-ephemera-ipc-os.workspace = true
 default = []
 # Optional entry points for a cargo-fuzz harness. Not built in production.
 fuzz = []
+# Scripted/in-memory demonstrations; never enable in a production daemon.
+reference-pilots = []
 
 [dev-dependencies]
 rcgen = "0.14.10"
@@ -97,3 +99,16 @@ overflow-checks = true
 [[bench]]
 name = "lifecycle_bench"
 harness = false
+
+
+[[test]]
+name = "pilot_github_issue"
+required-features = ["reference-pilots"]
+
+[[test]]
+name = "pilot_field_idempotency"
+required-features = ["reference-pilots"]
+
+[[test]]
+name = "installation_smoke"
+required-features = ["reference-pilots"]

@@ -197,7 +197,7 @@ fn remote_plaintext_or_insecure_redis_is_not_an_enterprise_backend() {
 #[test]
 fn file_checkpoint_requires_monotonic_sequence_and_a_fresh_stream() {
     let directory = std::env::temp_dir().join(format!("nexus-audit-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&directory).unwrap();
+    nexus_ephemera_ipc_os::create_private_directory(&directory).unwrap();
     let path = directory.join("anchor.json");
     let sink = FileCheckpointSink::new(path.clone());
     let mut ledger = AuditLedger::try_new().unwrap();
@@ -219,6 +219,8 @@ fn file_checkpoint_requires_monotonic_sequence_and_a_fresh_stream() {
             .store(&ledger.checkpoint(), &ledger.export_json())
             .is_err()
     );
+    drop(sink);
+    std::fs::remove_file(path.with_extension("writer.lock")).unwrap();
     std::fs::remove_file(path.with_extension("audit.json")).unwrap();
     std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(directory).unwrap();

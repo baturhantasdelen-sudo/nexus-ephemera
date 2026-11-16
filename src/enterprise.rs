@@ -373,10 +373,41 @@ impl TenantDirectory {
         presented_attributes: &[(String, String)],
         now_unix_ms: u64,
     ) -> Result<TenantGrant, IpcError> {
+        strict_service_target(endpoint)?;
+        let role = self.authenticate(secret, token, asserted_account, now_unix_ms)?;
+        let account_id = asserted_account.to_string();
+        let account = self
+            .accounts
+            .get(asserted_account)
+            .ok_or(IpcError::TargetDenied)?;
+        let mut presented_sorted = presented_attributes.to_vec();
+        presented_sorted.sort();
+        if presented_sorted != account.attributes
+            || !account.allowlist.iter().any(|item| item == endpoint)
+            || !account
+                .role_endpoints
+                .get(&role)
+                .is_some_and(|items| items.iter().any(|item| item == endpoint))
+        {
+            return Err(IpcError::TargetDenied);
+        }
+        Ok(TenantGrant {
+            service_account_id: account_id,
+            role,
+            endpoint: endpoint.to_string(),
+        })
+    }
+
+    pub(crate) fn authenticate(
+        &self,
+        secret: &[u8],
+        token: &str,
+        asserted_account: &str,
+        now_unix_ms: u64,
+    ) -> Result<String, IpcError> {
         if token.len() > 512 {
             return Err(IpcError::TargetDenied);
         }
-        strict_service_target(endpoint)?;
         let (account_id, role, expires, policy) = parse_token(token)?;
         if account_id != asserted_account {
             return Err(IpcError::TargetDenied);
@@ -401,22 +432,7 @@ impl TenantDirectory {
         if !account.roles.iter().any(|item| item == &role) {
             return Err(IpcError::TargetDenied);
         }
-        let mut presented_sorted = presented_attributes.to_vec();
-        presented_sorted.sort();
-        if presented_sorted != account.attributes
-            || !account.allowlist.iter().any(|item| item == endpoint)
-            || !account
-                .role_endpoints
-                .get(&role)
-                .is_some_and(|items| items.iter().any(|item| item == endpoint))
-        {
-            return Err(IpcError::TargetDenied);
-        }
-        Ok(TenantGrant {
-            service_account_id: account_id,
-            role,
-            endpoint: endpoint.to_string(),
-        })
+        Ok(role)
     }
 
     pub(crate) fn account_attributes(&self, account: &str) -> Option<&[(String, String)]> {
@@ -760,9 +776,7 @@ impl WorkerGate {
         loop {
             let current = self.inflight.load(Ordering::SeqCst);
             if current >= WORKER_CAP {
-                return Err(IpcError::Protocol(
-                    "ipc io: pending operation capacity exhausted",
-                ));
+                return Err(IpcError::RateLimited);
             }
             if self
                 .inflight

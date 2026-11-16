@@ -802,9 +802,11 @@ impl EphemeralBuffer {
         if !current_thread_holds_permit() {
             return Err("sensitive read requires an operation permit".into());
         }
-        Ok(SensitiveRead {
-            guard: lock_or_recover(self.storage.as_ref()),
-        })
+        let guard = lock_or_recover(self.storage.as_ref());
+        if !guard.inner.is_active() {
+            return Err("sensitive buffer is not active".into());
+        }
+        Ok(SensitiveRead { guard })
     }
 
     /// Kilitli bellek üzerinden işlem — düz metin kopyası üretmez.
@@ -815,6 +817,9 @@ impl EphemeralBuffer {
     ) -> Result<R, String> {
         let _permit = acquire_operation_permit()?;
         let guard = lock_or_recover(self.storage.as_ref());
+        if !guard.inner.is_active() {
+            return Err("sensitive buffer is not active".into());
+        }
         let result = f(guard.inner.as_slice());
         drop(guard);
         result

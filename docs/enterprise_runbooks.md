@@ -1,3 +1,7 @@
+> 0.3.0-rc.1 update: [production execution contract](production_execution.md)
+> is authoritative for native GitHub, private files, audit stream recovery,
+> reference-mode isolation and the remaining deployment gates.
+
 # Enterprise deployment and recovery
 
 ## Mandatory production gate

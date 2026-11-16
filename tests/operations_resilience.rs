@@ -22,10 +22,14 @@ const BODY: &str = "The queue is stuck";
 #[test]
 fn operations_drills_rotate_shed_quarantine_and_keep_exports_closed() {
     let mut ring = KeyRing::new(OLD.to_vec()).expect("ring");
-    let old_header = ring.sign_request(NOW, "idem-rotate", "sha256:payload", CHARGE);
+    let old_header = ring
+        .sign_request(NOW, "idem-rotate", "sha256:payload", CHARGE)
+        .expect("active key");
     ring.rotate(NEW.to_vec(), NOW, Duration::from_secs(10))
         .expect("rotate");
-    let new_header = ring.sign_request(NOW, "idem-rotate", "sha256:payload", CHARGE);
+    let new_header = ring
+        .sign_request(NOW, "idem-rotate", "sha256:payload", CHARGE)
+        .expect("active key");
     assert!(
         ring.verify_request(
             &old_header,
@@ -63,6 +67,18 @@ fn operations_drills_rotate_shed_quarantine_and_keep_exports_closed() {
         "sha256:payload",
         CHARGE,
     );
+    let empty_key_forgery = sign_request_header(b"", NOW, "idem-rotate", "sha256:payload", CHARGE);
+    assert!(
+        ring.verify_request(
+            &empty_key_forgery,
+            "idem-rotate",
+            "sha256:payload",
+            CHARGE,
+            NOW
+        )
+        .is_err(),
+        "clock rollback cannot resurrect a wiped retired key as an empty key"
+    );
     assert!(matches!(
         ring.verify_request(
             &forged,
@@ -73,13 +89,17 @@ fn operations_drills_rotate_shed_quarantine_and_keep_exports_closed() {
         ),
         Err(IpcError::TargetDenied)
     ));
-    let stale = ring.sign_request(NOW - 30_000, "idem-rotate", "sha256:payload", CHARGE);
+    let stale = ring
+        .sign_request(NOW - 30_000, "idem-rotate", "sha256:payload", CHARGE)
+        .expect("active key");
     assert!(matches!(
         ring.verify_request(&stale, "idem-rotate", "sha256:payload", CHARGE, NOW + 1_000),
         Err(IpcError::TargetDenied)
     ));
     let mut immediate = KeyRing::new(OLD.to_vec()).expect("immediate");
-    let retired = immediate.sign_request(NOW, "idem-rotate", "sha256:payload", CHARGE);
+    let retired = immediate
+        .sign_request(NOW, "idem-rotate", "sha256:payload", CHARGE)
+        .expect("active key");
     immediate
         .rotate(NEW.to_vec(), NOW, Duration::ZERO)
         .expect("rotate without grace");
@@ -130,10 +150,7 @@ fn operations_drills_rotate_shed_quarantine_and_keep_exports_closed() {
         panic!("33rd worker was admitted");
     };
     assert_eq!(shed_status(&shed), Some(503));
-    assert_eq!(
-        format!("{shed}"),
-        "ipc: ipc io: pending operation capacity exhausted"
-    );
+    assert_eq!(format!("{shed}"), "ipc: principal rate limit");
     drop(permits.pop());
     assert!(gate.try_acquire().is_ok());
     drop(permits);

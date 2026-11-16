@@ -19,7 +19,7 @@ async fn enterprise_two_daemons_forward_once_and_enforce_raw_ipc_policy() {
     let redis_url = std::env::var("NEXUS_TEST_REDIS_URL").expect("real Redis URL required");
     let id = uuid::Uuid::new_v4().simple().to_string();
     let directory_path = std::env::temp_dir().join(format!("nx-{}", &id[..12]));
-    std::fs::create_dir(&directory_path).unwrap();
+    nexus_ephemera_ipc_os::create_private_directory(&directory_path).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -28,6 +28,7 @@ async fn enterprise_two_daemons_forward_once_and_enforce_raw_ipc_policy() {
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let ca_path = directory_path.join("ca.der");
     std::fs::write(&ca_path, certificate.cert.der()).unwrap();
+    nexus_ephemera_ipc_os::lock_file_to_current_user(&ca_path).unwrap();
     let private_key = tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(
         certificate.signing_key.serialize_der(),
     );
@@ -169,6 +170,7 @@ async fn enterprise_two_daemons_forward_once_and_enforce_raw_ipc_policy() {
         }],"redis_url":redis_url,"namespace":namespace,"capacity":32,
             "checkpoint_path":directory_path.join(format!("anchor{index}.json")),"provider_ca_der":ca_path});
         std::fs::write(&config_path, config.to_string()).unwrap();
+        nexus_ephemera_ipc_os::lock_file_to_current_user(&config_path).unwrap();
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_nexus-daemon"))
             .args([
                 "--listen",

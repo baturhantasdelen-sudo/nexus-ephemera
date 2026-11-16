@@ -1,6 +1,6 @@
 # Enterprise integration
 
-This guide is for teams embedding `nexus-ephemera` 0.2.0. The guarantee is **verified wiping of managed memory and bounded retention (Sensitive-Memory Lifecycle Protection)**. It is not a claim of zero residue on hardware.
+This guide describes the original core API; the current remediation candidate is 0.3.0-rc.1. For production deployment the [enforced execution contract](production_execution.md) takes precedence. The guarantee is **verified wiping of managed memory and bounded retention (Sensitive-Memory Lifecycle Protection)**. It is not a claim of zero residue on hardware.
 
 ## Threat-model boundary
 
@@ -42,7 +42,7 @@ Rules enforced before dispatch:
 
 | Tag | Behavior |
 | --- | --- |
-| `SingleUse` | The authority is consumed before `dispatch`. The operation permit stays held across digest, dispatch, and seal, so apoptosis cannot finish wiping during the call. A panic during dispatch still seals through `Drop`. A second execute returns `SingleUseConsumed`. |
+| `SingleUse` | The authority is consumed before `dispatch`. Key access is permit-protected. Arbitrary user transport callbacks are not covered by a permit across external execution; the built-in native HTTP edges separately retain their bounded I/O permit. An already accepted external effect cannot be undone by apoptosis. A panic during dispatch still seals through `Drop`. A second execute returns `SingleUseConsumed`. |
 | `ExpiresAt` | A deadline in the past seals the context and returns `Expired` without dispatch. |
 | `ProviderBound` | Any other endpoint returns `ProviderMismatch` without dispatch. |
 | `Allowlist` | Exact endpoint match against the admitted list. An empty list is rejected at admission. Prefixes do not match. |

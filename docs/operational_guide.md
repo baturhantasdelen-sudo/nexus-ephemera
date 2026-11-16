@@ -1,6 +1,6 @@
 # Operational guide
 
-This is the pilot guide for `nexus-ephemera` 0.2.0. It covers installing `nexus-daemon`, the 64 MiB lock quota, `CleanupIncomplete` retries, and integer metrics. It does not add a guarantee against privileged `ptrace`, cold boot, DMA, or a physical DRAM read.
+This is the historical pilot guide for `nexus-ephemera` 0.2.0; the current 0.3.0-rc.1 candidate uses the [production execution contract](production_execution.md). It covers installing `nexus-daemon`, the 64 MiB lock quota, `CleanupIncomplete` retries, and integer metrics. It does not add a guarantee against privileged `ptrace`, cold boot, DMA, or a physical DRAM read.
 
 ## Install
 
@@ -79,7 +79,7 @@ prlimit --pid <daemon-pid> --memlock
 
 `--timeout-ms` bounds each IPC read and each IPC write on one accepted connection. The default is 5000 ms. The allowed range is 1 ms through 120 s. A peer that connects and sends nothing is dropped with a timeout. A frame longer than `--max-payload` (hard cap 64 KiB) is rejected before the body is allocated.
 
-The daemon serves one IPC connection at a time. Provider dispatch runs on one isolated worker thread without holding a wipe permit. A deadline returns Inconclusive, not proof of cancellation. The worker may still finish an external side effect. While it is occupied, fresh dispatches are refused. An uncertain key retains a non-expiring, process-local tombstone; retries cannot dispatch it again. Late completion restores transport availability but does not turn the uncertain receipt into success. Providers must enforce their own I/O deadline. A permanently blocked worker requires operational intervention; Rust cannot safely kill it.
+The daemon serves one IPC connection at a time. Provider dispatch runs on an isolated worker thread. Custom callbacks may outlive the broker wait budget; the built-in native HTTP transports hold a lifecycle permit through their deadline-bounded I/O. A deadline returns Inconclusive, not proof of cancellation. The worker may still finish an external side effect. While it is occupied, fresh dispatches are refused. In reference mode an uncertain key retains a non-expiring, process-local tombstone; production enterprise mode requires durable Redis claims, including across restart; retries cannot dispatch it again. Late completion restores transport availability but does not turn the uncertain receipt into success. Providers must enforce their own I/O deadline. A permanently blocked worker requires operational intervention; Rust cannot safely kill it.
 
 After `dispatch` returns, the outcome is stored under the idempotency key. A client that retries because its own timeout fired is served from that cache when the first attempt has finished. The retry does not call `dispatch` again.
 

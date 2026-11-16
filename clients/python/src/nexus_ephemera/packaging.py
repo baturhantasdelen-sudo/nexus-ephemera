@@ -47,12 +47,23 @@ def policy_tag(key: bytes, policy: bytes) -> str:
 
 
 def load_package(directory: Path) -> LoadedPackage:
+    invalid = False
+    try:
+        return _load_package(directory)
+    except Exception:
+        invalid = True
+    if invalid:
+        raise ProtocolError("package validation failed; use the Rust daemon --check on Windows")
+    raise ProtocolError("package validation failed")
+
+
+def _load_package(directory: Path) -> LoadedPackage:
     if not directory.is_dir():
         raise ProtocolError("package directory is missing")
     for name in _FILES:
         _private(directory / name)
-    config = _parse_config((directory / "config.toml").read_bytes())
-    env = _parse_env((directory / ".env").read_bytes())
+    config = _parse_config(_read_private(directory / "config.toml"))
+    env = _parse_env(_read_private(directory / ".env"))
     if (
         env["listen"] != config["listen"]
         or env["policy"] != config["policy"]
@@ -62,12 +73,12 @@ def load_package(directory: Path) -> LoadedPackage:
         raise ProtocolError("package env does not match config.toml")
     if config["policy"] != "pilot_support_agent.json":
         raise ProtocolError("package policy path is not the pilot file")
-    policy_bytes = (directory / "pilot_support_agent.json").read_bytes()
+    policy_bytes = _read_private(directory / "pilot_support_agent.json")
     policy = GithubIssuePolicy.load(policy_bytes)
     if config["allow"] != policy.endpoint:
         raise ProtocolError("package allowlist does not match the policy")
-    key = (directory / "hmac.key").read_bytes()
-    signature = (directory / "policy.hmac").read_text(encoding="ascii").strip()
+    key = _read_private(directory / "hmac.key")
+    signature = _read_private(directory / "policy.hmac").decode("ascii").strip()
     expected = policy_tag(key, policy_bytes)
     if len(expected) != len(signature) or not hmac.compare_digest(expected, signature):
         raise ProtocolError("package policy hmac does not match")
@@ -107,12 +118,34 @@ def rollup_health(
     )
 
 
+def _read_private(path: Path) -> bytes:
+    import stat
+    if os.name != "posix":
+        # Python is a thin client, not a Windows security-descriptor validator.
+        # The authoritative package check is the Rust daemon, never a silent pass.
+        raise ProtocolError("native Windows package validation requires Rust --check")
+    descriptor = os.open(path, os.O_RDONLY | int(getattr(os, "O_NOFOLLOW")) | int(getattr(os, "O_NONBLOCK")))
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+            or metadata.st_uid != getattr(os, "getuid")() or metadata.st_mode & 0o777 != 0o600
+            or not 0 < metadata.st_size <= 65536):
+            raise ProtocolError("private package file required")
+        chunks = bytearray()
+        while len(chunks) <= 65536:
+            part = os.read(descriptor, min(4096, 65537 - len(chunks)))
+            if not part:
+                break
+            chunks.extend(part)
+        if not chunks or len(chunks) > 65536:
+            raise ProtocolError("package file too large")
+        return bytes(chunks)
+    finally:
+        os.close(descriptor)
+
+
 def _private(path: Path) -> None:
-    if not path.is_file() or path.is_symlink():
-        raise ProtocolError("package file must be a regular file")
-    if os.name == "posix":
-        if path.stat().st_mode & 0o777 != 0o600:
-            raise ProtocolError("package file must be mode 0600")
+    _read_private(path)
 
 
 def _parse_config(raw: bytes) -> dict[str, str]:

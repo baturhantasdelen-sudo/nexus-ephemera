@@ -22,7 +22,7 @@ const TOKEN_WINDOW_MS: u64 = 60_000;
 
 pub struct FieldPilot {
     directory: TenantDirectory,
-    secret: Zeroizing<Vec<u8>>,
+    secret: crate::apoptosis::EphemeralBuffer,
     transport: GithubIssueTransport,
 }
 
@@ -51,6 +51,8 @@ impl FieldPilot {
         policy: GithubIssuePolicy,
         provider_token: Vec<u8>,
     ) -> Result<Self, IpcError> {
+        let secret = Zeroizing::new(secret);
+        let provider_token = Zeroizing::new(provider_token);
         if secret.is_empty() || secret.len() > 4096 {
             return Err(IpcError::Malformed);
         }
@@ -68,8 +70,9 @@ impl FieldPilot {
         }])?;
         Ok(Self {
             directory,
-            secret: Zeroizing::new(secret),
-            transport: GithubIssueTransport::from_http(http, policy, provider_token)?,
+            secret: crate::apoptosis::EphemeralBuffer::from_bytes(&secret)
+                .map_err(|_| IpcError::TargetDenied)?,
+            transport: GithubIssueTransport::from_http(http, policy, provider_token.to_vec())?,
         })
     }
 
@@ -85,12 +88,12 @@ impl FieldPilot {
     ) -> Result<IssueReceipt, IpcError> {
         if let Err(err) = self.authorize(request.endpoint, request.now_unix_ms) {
             if matches!(err, IpcError::TargetDenied) {
-                let _ = self.note(ledger, denied(&request));
+                self.note(ledger, denied(&request))?;
             }
             return Err(err);
         }
         if request.method != "POST" {
-            let _ = self.note(ledger, denied(&request));
+            self.note(ledger, denied(&request))?;
             return Err(IpcError::TargetDenied);
         }
         match self.transport.open_issue(
@@ -100,24 +103,9 @@ impl FieldPilot {
             request.idempotency_key,
             ledger,
         ) {
-            Ok(receipt) => {
-                if receipt.duplicate_status.is_none() {
-                    self.note(
-                        ledger,
-                        Note {
-                            kind: AuditKind::Retained,
-                            endpoint: &receipt.target_endpoint,
-                            payload_hash: &receipt.payload_hash,
-                            idempotency_key: &receipt.idempotency_key,
-                            binding_digest_hex: &receipt.binding_digest_hex,
-                            transport_status: receipt.transport_status,
-                        },
-                    )?;
-                }
-                Ok(receipt)
-            }
+            Ok(receipt) => Ok(receipt),
             Err(IpcError::IdempotencyConflict) => {
-                let _ = self.note(
+                self.note(
                     ledger,
                     Note {
                         kind: AuditKind::IdempotencyConflict,
@@ -127,7 +115,7 @@ impl FieldPilot {
                         binding_digest_hex: "",
                         transport_status: 0,
                     },
-                );
+                )?;
                 Err(IpcError::IdempotencyConflict)
             }
             Err(err) => Err(err),
@@ -138,21 +126,19 @@ impl FieldPilot {
         let expires = now_unix_ms
             .checked_add(TOKEN_WINDOW_MS)
             .ok_or(IpcError::Malformed)?;
-        let token = self.directory.issue_token(
-            &self.secret,
-            SERVICE_ACCOUNT,
-            ROLE,
-            expires,
-            now_unix_ms,
-        )?;
-        self.directory.authorize(
-            &self.secret,
-            &token,
-            SERVICE_ACCOUNT,
-            endpoint,
-            &[],
-            now_unix_ms,
-        )?;
+        self.secret
+            .with_sensitive_bytes(|key| {
+                let token = Zeroizing::new(
+                    self.directory
+                        .issue_token(key, SERVICE_ACCOUNT, ROLE, expires, now_unix_ms)
+                        .map_err(|_| "tenant denied".to_string())?,
+                );
+                self.directory
+                    .authorize(key, &token, SERVICE_ACCOUNT, endpoint, &[], now_unix_ms)
+                    .map_err(|_| "tenant denied".to_string())?;
+                Ok(())
+            })
+            .map_err(|_| IpcError::TargetDenied)?;
         Ok(())
     }
 

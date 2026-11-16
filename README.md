@@ -1,6 +1,8 @@
 # nexus-ephemera
 
-Sensitive-memory lifecycle protection for an offline scout, an AEAD mesh, and brokered agent calls. Version 0.2.0.
+Sensitive-memory lifecycle protection for an offline scout, an AEAD mesh, and brokered agent calls. Version 0.3.0-rc.1 (remediation candidate; not a sealed release).
+
+Production agents must use `TenantClient.execute_payload` against `nexus-daemon --enterprise-config`. See [the enforced execution contract](docs/production_execution.md). The `reference-pilots` feature and `--reference-mode` are demonstrations, not durable production paths.
 
 The library verifies wipe and bounds how long a managed buffer is retained. It does not claim a zero footprint. `mlock`, `VirtualLock`, `MADV_DONTDUMP`, and `PR_SET_DUMPABLE` do not stop a privileged tracer, cold boot, DMA, or a physical DRAM read.
 

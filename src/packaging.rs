@@ -14,7 +14,7 @@ use std::time::Duration;
 use orion::hazardous::mac::hmac::sha256::{HmacSha256, SecretKey};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::adapters::github::GithubIssuePolicy;
 use crate::enterprise_runtime::RedisIdempotency;
@@ -72,6 +72,12 @@ struct PackageWatch {
     redis_url: String,
 }
 
+impl Drop for PackageWatch {
+    fn drop(&mut self) {
+        self.redis_url.zeroize();
+    }
+}
+
 impl HealthSource for PackageWatch {
     fn facts(&self) -> HealthFacts {
         let (policy_intact, hmac_ready) = match reread(&self.directory, &self.policy_sha256) {
@@ -90,7 +96,7 @@ pub fn write_template(directory: &Path, listen: &str, policy: &[u8]) -> Result<(
     if !valid_listen(listen) || policy.is_empty() || policy.len() > 65_536 {
         return Err(IpcError::Protocol("package template is invalid"));
     }
-    fs::create_dir_all(directory)?;
+    nexus_ephemera_ipc_os::create_private_directory(directory)?;
     let policy_name = "pilot_support_agent.json";
     let config = format!(
         "listen = \"{listen}\"\ntimeout_ms = 5000\npolicy = \"{policy_name}\"\nallow = \"https://api.github.com/repos/pilot-org/support-queue/issues\"\nredis = \"\"\n"
@@ -105,6 +111,7 @@ pub fn write_template(directory: &Path, listen: &str, policy: &[u8]) -> Result<(
 }
 
 pub fn seal(directory: &Path) -> Result<(), IpcError> {
+    nexus_ephemera_ipc_os::assert_private_directory(directory)?;
     let policy = read_capped(&directory.join("pilot_support_agent.json"))?;
     let key_path = directory.join("hmac.key");
     if !key_path.exists() {
@@ -112,9 +119,15 @@ pub fn seal(directory: &Path) -> Result<(), IpcError> {
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, key.as_mut_slice());
         write_new(&key_path, &key)?;
     }
-    let key = read_capped(&key_path)?;
+    let key = Zeroizing::new(read_capped(&key_path)?);
     let tag = policy_tag(&key, &policy)?;
-    fs::write(directory.join("policy.hmac"), hex(&tag).as_bytes())?;
+    let signature_path = directory.join("policy.hmac");
+    if signature_path.exists() {
+        // Do not follow an attacker-controlled path during re-sealing.
+        nexus_ephemera_ipc_os::assert_private_file(&signature_path)?;
+        fs::remove_file(&signature_path)?;
+    }
+    write_new(&signature_path, hex(&tag).as_bytes())?;
     for name in FILES {
         nexus_ephemera_ipc_os::lock_file_to_current_user(&directory.join(name))?;
     }
@@ -122,6 +135,7 @@ pub fn seal(directory: &Path) -> Result<(), IpcError> {
 }
 
 pub fn load(directory: &Path) -> Result<LoadedPackage, IpcError> {
+    nexus_ephemera_ipc_os::assert_private_directory(directory)?;
     if !directory.is_dir() {
         return Err(IpcError::Protocol("package directory is missing"));
     }
@@ -130,12 +144,12 @@ pub fn load(directory: &Path) -> Result<LoadedPackage, IpcError> {
             IpcError::Protocol("package file must be mode 0600 or a current-user DACL")
         })?;
     }
-    let config = read_capped(&directory.join("config.toml"))?;
-    let env = read_capped(&directory.join(".env"))?;
+    let config = Zeroizing::new(read_capped(&directory.join("config.toml"))?);
+    let env = Zeroizing::new(read_capped(&directory.join(".env"))?);
     let policy_bytes = read_capped(&directory.join("pilot_support_agent.json"))?;
-    let key = read_capped(&directory.join("hmac.key"))?;
+    let key = Zeroizing::new(read_capped(&directory.join("hmac.key"))?);
     let signature = read_capped(&directory.join("policy.hmac"))?;
-    let fields = parse_config(&config)?;
+    let mut fields = parse_config(&config)?;
     let env_fields = parse_env(&env)?;
     if env_fields.listen != fields.listen
         || env_fields.policy != fields.policy
@@ -160,13 +174,13 @@ pub fn load(directory: &Path) -> Result<LoadedPackage, IpcError> {
         RedisIdempotency::new(&fields.redis, REDIS_NAMESPACE, 32, Duration::from_secs(2))?;
     }
     Ok(LoadedPackage {
-        listen: fields.listen,
-        allow: fields.allow,
+        listen: std::mem::take(&mut fields.listen),
+        allow: std::mem::take(&mut fields.allow),
         timeout: Duration::from_millis(fields.timeout_ms),
         watch: PackageWatch {
             directory: directory.to_path_buf(),
             policy_sha256: hex(&Sha256::digest(&policy_bytes)),
-            redis_url: fields.redis,
+            redis_url: std::mem::take(&mut fields.redis),
         },
     })
 }
@@ -198,7 +212,7 @@ fn reread(directory: &Path, expected_sha: &str) -> Result<(), IpcError> {
     if hex(&Sha256::digest(&policy)) != expected_sha {
         return Err(IpcError::Protocol("package policy hash changed"));
     }
-    let key = read_capped(&directory.join("hmac.key"))?;
+    let key = Zeroizing::new(read_capped(&directory.join("hmac.key"))?);
     let signature = read_capped(&directory.join("policy.hmac"))?;
     verify_tag(&key, &policy, &signature)
 }
@@ -235,6 +249,12 @@ struct Fields {
     policy: String,
     allow: String,
     redis: String,
+}
+
+impl Drop for Fields {
+    fn drop(&mut self) {
+        self.redis.zeroize();
+    }
 }
 
 fn parse_config(bytes: &[u8]) -> Result<Fields, IpcError> {
@@ -389,16 +409,15 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), IpcError> {
     if path.exists() {
         return Err(IpcError::Protocol("package file already exists"));
     }
-    fs::write(path, bytes)?;
+    use std::io::Write;
+    let mut file = nexus_ephemera_ipc_os::create_private_file(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     Ok(())
 }
 
 fn read_capped(path: &Path) -> Result<Vec<u8>, IpcError> {
-    let meta = fs::metadata(path)?;
-    if !meta.is_file() || meta.len() == 0 || meta.len() > 65_536 {
-        return Err(IpcError::Malformed);
-    }
-    Ok(fs::read(path)?)
+    Ok(nexus_ephemera_ipc_os::read_private_file(path, 65_536)?)
 }
 
 fn decode_hex(value: &str) -> Result<[u8; 32], IpcError> {

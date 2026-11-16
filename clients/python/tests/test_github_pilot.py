@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from nexus_ephemera.adapters.github import GithubIssuePolicy, GithubIssueTransport
+from nexus_ephemera.adapters.github import GithubIssuePolicy, ReferenceGithubIssueTransport
 from nexus_ephemera.enterprise import AuditLedger
 from nexus_ephemera.errors import IdempotencyConflict, Inconclusive, Malformed, TargetDenied
 
@@ -44,7 +44,7 @@ class Script:
 def test_support_agent_issue_contract() -> None:
     policy = GithubIssuePolicy.load()
     assert policy.endpoint == "https://api.github.com/repos/pilot-org/support-queue/issues"
-    transport = GithubIssueTransport(policy, TOKEN)
+    transport = ReferenceGithubIssueTransport(policy, TOKEN)
     assert "ghp_pilot_token_value" not in repr(transport)
     ledger = AuditLedger()
     provider = Script("success")
@@ -94,9 +94,12 @@ def test_support_agent_issue_contract() -> None:
     assert server.duplicate_status == 409
     assert failed.creates == 1
     retried = Script("timeout-missing")
-    opened = transport.open_issue(retried, "Printer jam", "The queue is stuck", "issue-retry", ledger)
-    assert opened.duplicate_status is None
-    assert retried.creates == 2
+    import pytest
+    with pytest.raises(Inconclusive):
+        transport.open_issue(retried, "Printer jam", "The queue is stuck", "issue-retry", ledger)
+    with pytest.raises(Inconclusive):
+        transport.open_issue(retried, "Printer jam", "The queue is stuck", "issue-retry", ledger)
+    assert retried.creates == 1
     assert ledger.verify()
     exported = ledger.export_json()
     assert "audit_v2" in exported

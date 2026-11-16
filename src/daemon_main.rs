@@ -23,8 +23,10 @@ struct LaunchArgs {
     enterprise_path: Option<std::path::PathBuf>,
     package_dir: Option<std::path::PathBuf>,
     listen_explicit: bool,
+    reference_mode: bool,
     seal_package: bool,
     check_package: bool,
+    init_package: bool,
     provision_store: bool,
     issue_token: Option<(String, String, u64)>,
 }
@@ -39,6 +41,10 @@ struct EnterpriseFile {
     checkpoint_path: std::path::PathBuf,
     #[serde(default)]
     provider_ca_der: Option<std::path::PathBuf>,
+    #[serde(default)]
+    github_policy: Option<std::path::PathBuf>,
+    #[serde(default)]
+    github_token_file: Option<std::path::PathBuf>,
 }
 
 impl Drop for EnterpriseFile {
@@ -50,12 +56,14 @@ impl Drop for EnterpriseFile {
 enum DaemonTransport {
     Local(LocalAcceptTransport),
     Http(HttpPayloadTransport),
+    Github(nexus_ephemera::adapters::github_production::GithubTransport),
 }
 impl SecureTransport for DaemonTransport {
     fn dispatch(&mut self, call: &AuthorizedCall<'_>) -> Result<TransportReply, BrokerError> {
         match self {
             Self::Local(inner) => inner.dispatch(call),
             Self::Http(inner) => inner.dispatch(call),
+            Self::Github(inner) => inner.dispatch(call),
         }
     }
     fn dispatch_payload(
@@ -68,6 +76,7 @@ impl SecureTransport for DaemonTransport {
                 "enterprise provider is not configured",
             )),
             Self::Http(inner) => inner.dispatch_payload(call, payload),
+            Self::Github(inner) => inner.dispatch_payload(call, payload),
         }
     }
 }
@@ -91,6 +100,16 @@ fn run() -> Result<(), IpcError> {
     harden_before_secret()?;
     let args = parse_args(std::env::args().skip(1))?;
     if let Some(dir) = &args.package_dir {
+        if args.init_package {
+            nexus_ephemera::packaging::write_template(
+                dir,
+                &args.config.listen,
+                include_bytes!("../policies/pilot_support_agent.json"),
+            )?;
+            nexus_ephemera::packaging::seal(dir)?;
+            println!("package-created");
+            return Ok(());
+        }
         if args.seal_package {
             nexus_ephemera::packaging::seal(dir)?;
         }
@@ -99,7 +118,7 @@ fn run() -> Result<(), IpcError> {
             println!("package-ok");
             return Ok(());
         }
-    } else if args.seal_package || args.check_package {
+    } else if args.seal_package || args.check_package || args.init_package {
         return Err(IpcError::Protocol("package directory is required"));
     }
     let mut config = args.config;
@@ -121,16 +140,29 @@ fn run() -> Result<(), IpcError> {
         config.allowlist = vec![package.allow().to_string()];
         config.timeout = package.timeout();
     }
+    if args.enterprise_path.is_none() && !args.reference_mode {
+        return Err(IpcError::Protocol(
+            "enterprise configuration required; --reference-mode is simulation only",
+        ));
+    }
+    if args.enterprise_path.is_some() && args.reference_mode {
+        return Err(IpcError::Protocol(
+            "reference and enterprise modes cannot be combined",
+        ));
+    }
+    let cleanup_budget = config.timeout.saturating_add(Duration::from_secs(10));
     let max_connections = args.max_connections;
     let mut secret = read_secret(config.timeout)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let mut daemon = if let Some(path) = args.enterprise_path {
-        if std::fs::metadata(&path)?.len() > 65536 {
-            return Err(IpcError::Malformed);
-        }
-        let bytes = Zeroizing::new(std::fs::read(path)?);
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        nexus_ephemera_ipc_os::assert_private_directory(parent)?;
+        let bytes = Zeroizing::new(nexus_ephemera_ipc_os::read_private_file(&path, 65536)?);
         let mut enterprise: EnterpriseFile = serde_json::from_slice(&bytes)
             .map_err(|_| IpcError::Protocol("invalid enterprise configuration"))?;
         let directory = TenantDirectory::try_new(std::mem::take(&mut enterprise.accounts))?;
@@ -158,12 +190,28 @@ fn run() -> Result<(), IpcError> {
         let sink = Arc::new(FileCheckpointSink::new(enterprise.checkpoint_path.clone()));
         let mut http = HttpPayloadTransport::new(config.timeout)?;
         if let Some(ca) = &enterprise.provider_ca_der {
-            if std::fs::metadata(ca)?.len() > 65536 {
-                return Err(IpcError::Malformed);
-            }
-            http = http.with_ca_der(&std::fs::read(ca)?)?;
+            http = http.with_ca_der(&nexus_ephemera_ipc_os::read_private_file(ca, 65536)?)?;
         }
-        let transport = DaemonTransport::Http(http);
+        let transport = match (&enterprise.github_policy, &enterprise.github_token_file) {
+            (Some(policy_path), Some(token_path)) => {
+                let policy = nexus_ephemera::adapters::github::GithubIssuePolicy::load(
+                    &nexus_ephemera_ipc_os::read_private_file(policy_path, 65536)?,
+                )?;
+                let mut token =
+                    Zeroizing::new(nexus_ephemera_ipc_os::read_private_file(token_path, 256)?);
+                DaemonTransport::Github(
+                    nexus_ephemera::adapters::github_production::GithubTransport::new(
+                        http, policy, &mut token,
+                    )?,
+                )
+            }
+            (None, None) => DaemonTransport::Http(http),
+            _ => {
+                return Err(IpcError::Protocol(
+                    "both GitHub policy and token file are required",
+                ));
+            }
+        };
         runtime.block_on(BrokerDaemon::bind_enterprise(
             config,
             secret.as_mut_slice(),
@@ -173,6 +221,11 @@ fn run() -> Result<(), IpcError> {
             sink,
         ))?
     } else {
+        if package.is_some() {
+            return Err(IpcError::Protocol(
+                "package execution requires enterprise configuration",
+            ));
+        }
         if args.provision_store || args.issue_token.is_some() {
             return Err(IpcError::Protocol("enterprise configuration is required"));
         }
@@ -220,7 +273,11 @@ fn run() -> Result<(), IpcError> {
     // Always inspect cleanup, including errors and signal cancellation. A
     // timed-out provider must not be reported as a successful shutdown.
     let cleanup = daemon.shutdown();
-    let wipe = nexus_ephemera::apoptosis::trigger_apoptosis();
+    // A native edge can have a deadline longer than trigger's default ten
+    // seconds. On signal cancellation keep draining through that bounded I/O
+    // instead of terminating the process while its permit/key is still live.
+    let wipe = nexus_ephemera::apoptosis::trigger_apoptosis()
+        .or_else(|_| nexus_ephemera::apoptosis::wait_apoptosis_complete(cleanup_budget));
     cleanup?;
     if !matches!(wipe, Ok(nexus_ephemera::apoptosis::WipeStatus::Complete)) {
         return Err(IpcError::Protocol("daemon global cleanup incomplete"));
@@ -420,11 +477,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchArgs, IpcE
     let mut listen_explicit = false;
     let mut seal_package = false;
     let mut check_package = false;
+    let mut init_package = false;
     let mut provision_store = false;
     let mut issue_token = None;
+    let mut reference_mode = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--reference-mode" => reference_mode = true,
             "--enterprise-config" => {
                 enterprise_path = Some(std::path::PathBuf::from(required(
                     &mut args,
@@ -436,6 +496,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchArgs, IpcE
             }
             "--seal" => seal_package = true,
             "--check" => check_package = true,
+            "--init-package" => init_package = true,
             "--provision-store" => provision_store = true,
             "--issue-tenant-token" => {
                 let account = required(&mut args, "--issue-tenant-token")?;
@@ -477,7 +538,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchArgs, IpcE
             "--single-use" => single_use = true,
             "--help" => {
                 println!(
-                    "nexus-daemon --listen PATH --allow ENDPOINT [--allow ENDPOINT] [--max-payload N] [--timeout-ms N] [--idempotency-ttl-ms N] [--single-use] [--max-connections N] [--enterprise-config PATH] [--provision-store] [--issue-tenant-token ACCOUNT ROLE TTL_MS] [--package DIR] [--seal] [--check]\nkey is read from stdin; Ctrl-C requests verified cleanup; enterprise mode requires a durable Redis namespace and bound payload requests; --package validates config.toml, .env, and the pilot policy before the broker starts"
+                    "nexus-daemon --listen PATH --allow ENDPOINT [--allow ENDPOINT] [--max-payload N] [--timeout-ms N] [--idempotency-ttl-ms N] [--single-use] [--max-connections N] [--enterprise-config PATH | --reference-mode] [--provision-store] [--issue-tenant-token ACCOUNT ROLE TTL_MS] [--package DIR] [--init-package] [--seal] [--check]\nkey is read from stdin; Ctrl-C requests verified cleanup; enterprise mode requires a durable Redis namespace and bound payload requests; --package validates config.toml, .env, and the pilot policy before the broker starts"
                 );
                 std::process::exit(0);
             }
@@ -497,8 +558,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchArgs, IpcE
         enterprise_path,
         package_dir,
         listen_explicit,
+        reference_mode,
         seal_package,
         check_package,
+        init_package,
         provision_store,
         issue_token,
     })

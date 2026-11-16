@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import threading
 from dataclasses import dataclass
 
 from .errors import IdempotencyUnavailable, Inconclusive, TargetDenied
@@ -62,21 +63,31 @@ class TenantQuarantine:
         self._block_for_ms = block_for_ms
         self._denials: dict[str, int] = {}
         self._until: dict[str, int] = {}
+        self._lock = threading.RLock()
 
     def ensure(self, account: str, now: int) -> None:
-        until = self._until.get(account)
-        if until is not None and now < until:
-            raise TargetDenied()
-        if until is not None and now >= until:
-            self._denials[account] = 0
+        with self._lock:
+            until = self._until.get(account)
+            if until is not None and now < until:
+                raise TargetDenied()
+            if until is not None:
+                self._denials.pop(account, None)
+                self._until.pop(account, None)
+
+    def record_success(self, account: str) -> None:
+        with self._lock:
+            self._denials.pop(account, None)
             self._until.pop(account, None)
 
     def record_denial(self, account: str, now: int) -> None:
-        self.ensure(account, now)
-        count = self._denials.get(account, 0) + 1
-        self._denials[account] = count
-        if count >= self._threshold:
-            self._until[account] = now + self._block_for_ms
+        with self._lock:
+            self.ensure(account, now)
+            if account not in self._denials and len(self._denials) >= 4096:
+                raise Inconclusive()
+            count = self._denials.get(account, 0) + 1
+            self._denials[account] = count
+            if count >= self._threshold:
+                self._until[account] = now + self._block_for_ms
 
 
 def shed_status(message: str) -> int | None:
@@ -92,7 +103,8 @@ def close_store_outage(err: Exception) -> Exception:
 
 
 def _mac(secret: bytes, signed_at: int, key: str) -> str:
-    material = _DRILL + str(signed_at).encode() + key.encode()
+    encoded = key.encode("utf-8")
+    material = _DRILL + signed_at.to_bytes(8, "little") + len(encoded).to_bytes(8, "little") + encoded
     return hmac.new(secret, material, hashlib.sha256).hexdigest()
 
 

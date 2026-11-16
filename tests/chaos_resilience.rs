@@ -107,7 +107,7 @@ fn chaos_resilience_keeps_one_dispatch_and_a_verifiable_log() {
     assert!(matches!(
         ReferenceClusterNode::new(Arc::clone(&store), Arc::clone(&hits))
             .execute(&call_named("billing", "idem-new")),
-        Err(IpcError::Protocol(_))
+        Err(IpcError::Protocol("shared idempotency store is sealed"))
     ));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -122,10 +122,7 @@ fn chaos_resilience_keeps_one_dispatch_and_a_verifiable_log() {
     for _ in 0..WORKER_CAP {
         permits.push(gate.try_acquire().expect("slot"));
     }
-    assert!(matches!(
-        gate.try_acquire(),
-        Err(IpcError::Protocol(message)) if message.contains("capacity exhausted")
-    ));
+    assert!(matches!(gate.try_acquire(), Err(IpcError::RateLimited)));
     drop(permits.pop());
     let _released = gate.try_acquire().expect("slot after release");
 

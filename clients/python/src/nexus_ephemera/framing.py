@@ -181,8 +181,15 @@ def load_json_object(raw: bytearray) -> object:
     invalid = False
     parsed: object = None
     try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate field")
+                result[key] = value
+            return result
+        parsed = json.loads(raw, object_pairs_hook=unique)
+    except (ValueError, UnicodeError, RecursionError):
         invalid = True
     if invalid:
         raise Malformed()

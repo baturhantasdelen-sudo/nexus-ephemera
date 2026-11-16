@@ -16,6 +16,58 @@ const TOKEN: &[u8] = b"ghp_pilot_token_value";
 const HMAC: &[u8] = b"broker-hmac-secret";
 
 #[test]
+fn closed_or_exhausted_audit_never_replays_as_success() {
+    use nexus_ephemera::enterprise::{AuditEvent, AuditKind};
+    let policy =
+        GithubIssuePolicy::load(include_bytes!("../policies/pilot_support_agent.json")).unwrap();
+    let http = HttpPayloadTransport::new(Duration::from_secs(1)).unwrap();
+    let transport = GithubIssueTransport::from_http(&http, policy, TOKEN.to_vec()).unwrap();
+    let mut ledger = AuditLedger::try_new().unwrap();
+    ledger.close().unwrap();
+    let mut provider = Script::success();
+    for _ in 0..2 {
+        assert!(
+            transport
+                .open_issue(&mut provider, "title", "body", "closed-audit", &mut ledger)
+                .is_err()
+        );
+    }
+    assert_eq!(provider.creates, 0);
+    let mut ledger = AuditLedger::try_new().unwrap();
+    for _ in 0..1023 {
+        ledger
+            .append(&AuditEvent {
+                kind: AuditKind::Receipt,
+                service_account_id: "support".into(),
+                endpoint: "https://example.test/action".into(),
+                payload_hash: "digest".into(),
+                idempotency_key: "key".into(),
+                seal_report: String::new(),
+                binding_digest_hex: String::new(),
+                transport_status: 0,
+            })
+            .unwrap();
+    }
+    for _ in 0..2 {
+        assert!(
+            transport
+                .open_issue(
+                    &mut provider,
+                    "title",
+                    "body",
+                    "audit-full-after-create",
+                    &mut ledger
+                )
+                .is_err()
+        );
+    }
+    assert_eq!(
+        provider.creates, 1,
+        "post-dispatch audit failure must remain uncertain"
+    );
+}
+
+#[test]
 fn support_agent_opens_one_issue_and_reconciles_without_a_second_create() {
     let policy = GithubIssuePolicy::load(include_bytes!("../policies/pilot_support_agent.json"))
         .expect("policy");
@@ -153,29 +205,22 @@ fn support_agent_opens_one_issue_and_reconciles_without_a_second_create() {
     assert_eq!(timed_out.creates, 1);
 
     let mut missing = Script::timeout_then_create();
-    let retried = transport
-        .open_issue(
-            &mut missing,
-            "Printer jam",
-            "The queue is stuck",
-            "issue-retry",
-            &mut ledger,
-        )
-        .expect("retry");
-    assert_eq!(retried.duplicate_status, None);
-    assert_eq!(retried.transport_status, 201);
-    assert_eq!(missing.creates, 2);
-    let again = transport
-        .open_issue(
-            &mut missing,
-            "Printer jam",
-            "The queue is stuck",
-            "issue-retry",
-            &mut ledger,
-        )
-        .expect("cached after retry");
-    assert_eq!(again.duplicate_status, Some(409));
-    assert_eq!(missing.creates, 2);
+    for _ in 0..2 {
+        assert!(matches!(
+            transport.open_issue(
+                &mut missing,
+                "Printer jam",
+                "The queue is stuck",
+                "issue-retry",
+                &mut ledger
+            ),
+            Err(IpcError::Inconclusive)
+        ));
+    }
+    assert_eq!(
+        missing.creates, 1,
+        "search lag must never trigger another POST"
+    );
 
     let transport = Arc::new(transport);
     let shared = Arc::new(Mutex::new(Script::success()));

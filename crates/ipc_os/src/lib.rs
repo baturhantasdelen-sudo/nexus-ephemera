@@ -16,8 +16,14 @@ pub fn current_uid() -> io::Result<u32> {
 
 #[cfg(unix)]
 pub fn assert_private_file(path: &std::path::Path) -> io::Result<()> {
+    let file = open_private_file(path)?;
+    assert_private_handle(&file)
+}
+
+#[cfg(unix)]
+fn assert_private_handle(file: &std::fs::File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
+    let meta = file.metadata()?;
     if !meta.file_type().is_file() || meta.nlink() != 1 {
         return Err(io::Error::other("package file must be a regular file"));
     }
@@ -37,10 +43,118 @@ pub fn assert_private_file(path: &std::path::Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn open_private_file(path: &std::path::Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Bound and validate the same opened object that is read. Leaf symlinks and
+/// non-regular files are refused; callers must also secure the parent directory.
+pub fn read_private_file(path: &std::path::Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    if limit == 0 || limit > 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private read limit invalid",
+        ));
+    }
+    #[cfg(unix)]
+    let file = open_private_file(path)?;
+    #[cfg(windows)]
+    let file = windows::open_private_file(path)?;
+    #[cfg(unix)]
+    assert_private_handle(&file)?;
+    #[cfg(windows)]
+    windows::assert_private_handle(&file)?;
+    let size = file.metadata()?.len();
+    if size == 0 || size > limit as u64 {
+        return Err(std::io::Error::other("private file size invalid"));
+    }
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > limit {
+        return Err(std::io::Error::other("private file size invalid"));
+    }
+    Ok(std::mem::take(&mut *bytes))
+}
+
+/// A new private file; existing paths are never followed or overwritten.
+pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        windows::create_private_file(path)
+    }
+}
+
+pub fn assert_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_dir() || meta.uid() != current_uid()? || meta.mode() & 0o777 != 0o700 {
+            return Err(std::io::Error::other(
+                "private directory owner/mode required",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        windows::assert_private_directory(path)
+    }
+}
+
+/// Create the directory before placing any secret files in it. Existing
+/// directories must already be private; never chmod an arbitrary caller path.
+pub fn create_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    if !path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)?;
+        }
+        #[cfg(windows)]
+        {
+            std::fs::create_dir_all(path)?;
+            lock_file_to_current_user(path)?;
+        }
+    }
+    assert_private_directory(path)
+}
+
+#[cfg(unix)]
 pub fn lock_file_to_current_user(path: &std::path::Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    assert_private_file(path)
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let file = open_private_file(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != current_uid()? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private file owner/type required",
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    assert_private_handle(&file)
 }
 
 /// Exclusive PID lock for a daemon listen socket.
@@ -298,12 +412,6 @@ mod windows {
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn InitializeAcl(pacl: *mut ACL, n_acl_length: u32, dw_acl_revision: u32) -> i32;
-        fn AddAccessAllowedAce(
-            pacl: *mut ACL,
-            dw_ace_revision: u32,
-            access_mask: u32,
-            psid: PSID,
-        ) -> i32;
         fn GetLengthSid(sid: PSID) -> u32;
     }
 
@@ -579,6 +687,14 @@ mod windows {
     }
 
     fn user_only_acl(sid: PSID) -> io::Result<HeapAcl> {
+        user_only_acl_with_mask(sid, client_access_mask())
+    }
+
+    fn user_only_acl_with_mask(sid: PSID, mask: u32) -> io::Result<HeapAcl> {
+        user_only_acl_with_mask_and_flags(sid, mask, 0)
+    }
+
+    fn user_only_acl_with_mask_and_flags(sid: PSID, mask: u32, flags: u32) -> io::Result<HeapAcl> {
         let package = process_appcontainer_storage()?;
         let mut trustees = vec![sid];
         if let Some(storage) = &package {
@@ -597,10 +713,11 @@ mod windows {
                 return Err(io::Error::last_os_error());
             }
             for trustee in trustees {
-                if AddAccessAllowedAce(
+                if windows_sys::Win32::Security::AddAccessAllowedAceEx(
                     acl.as_mut_ptr(),
                     ACL_REVISION,
-                    client_access_mask(),
+                    flags,
+                    mask,
                     trustee,
                 ) == 0
                 {
@@ -612,6 +729,14 @@ mod windows {
     }
 
     fn dacl_is_current_user_only(handle: HANDLE, object_type: SE_OBJECT_TYPE) -> io::Result<()> {
+        dacl_is_current_user_only_with_mask(handle, object_type, client_access_mask())
+    }
+
+    fn dacl_is_current_user_only_with_mask(
+        handle: HANDLE,
+        object_type: SE_OBJECT_TYPE,
+        mask: u32,
+    ) -> io::Result<()> {
         let mut owner: PSID = ptr::null_mut();
         let mut dacl: *mut ACL = ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
@@ -657,8 +782,14 @@ mod windows {
             }
             let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
             if allowed.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
-                || allowed.Header.AceFlags != 0
-                || allowed.Mask != client_access_mask()
+                || allowed.Header.AceFlags
+                    & !(if mask == client_access_mask() {
+                        0
+                    } else {
+                        0x13
+                    })
+                    != 0
+                || allowed.Mask != mask
             {
                 return Err(io::Error::other("unexpected pipe ACE rights"));
             }
@@ -898,13 +1029,104 @@ mod windows {
     }
 
     pub fn assert_private_file(path: &std::path::Path) -> io::Result<()> {
+        assert_private_handle(&open_private_file(path)?)
+    }
+
+    pub(super) fn create_private_file(path: &std::path::Path) -> io::Result<std::fs::File> {
+        use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+        use windows_sys::Win32::Security::{
+            InitializeSecurityDescriptor, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+            SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+            SetSecurityDescriptorGroup, SetSecurityDescriptorOwner,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+        };
+        let (sid, _storage, _token) = current_process_user_sid()?;
+        let mut acl = user_only_acl_with_mask(
+            sid,
+            windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+        )?;
+        // All backing objects remain live throughout synchronous CreateFileW.
+        let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let descriptor_ptr = std::ptr::from_mut(&mut descriptor).cast();
+        unsafe {
+            if InitializeSecurityDescriptor(descriptor_ptr, 1) == 0
+                || SetSecurityDescriptorOwner(descriptor_ptr, sid, 0) == 0
+                || SetSecurityDescriptorGroup(descriptor_ptr, sid, 0) == 0
+                || SetSecurityDescriptorDacl(descriptor_ptr, 1, acl.as_mut_ptr(), 0) == 0
+                || SetSecurityDescriptorControl(
+                    descriptor_ptr,
+                    SE_DACL_PROTECTED,
+                    SE_DACL_PROTECTED,
+                ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor_ptr,
+            bInheritHandle: 0,
+        };
+        let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if name.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private file path contains NUL",
+            ));
+        }
+        name.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // Ownership is transferred exactly once to File.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+
+    pub(super) fn open_private_file(path: &std::path::Path) -> io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(path)
+    }
+
+    pub(super) fn assert_private_handle(file: &std::fs::File) -> io::Result<()> {
+        use std::os::windows::fs::MetadataExt;
         use std::os::windows::io::AsRawHandle;
-        let meta = std::fs::metadata(path)?;
-        if !meta.is_file() {
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.file_attributes() & 0x400 != 0 {
             return Err(io::Error::other("package file must be a regular file"));
         }
-        let file = std::fs::File::open(path)?;
-        dacl_is_current_user_only(file.as_raw_handle() as HANDLE, SE_FILE_OBJECT)
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if information.nNumberOfLinks != 1 {
+            return Err(io::Error::other("private files cannot have hard links"));
+        }
+        dacl_is_current_user_only_with_mask(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+        )
     }
 
     pub fn lock_file_to_current_user(path: &std::path::Path) -> io::Result<()> {
@@ -912,14 +1134,23 @@ mod windows {
         use std::os::windows::io::AsRawHandle;
         const READ_CONTROL: u32 = 0x0002_0000;
         let file = std::fs::OpenOptions::new()
+            .custom_flags(0x0200_0000 | 0x0020_0000)
             .access_mode(
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
             )
             .open(path)?;
         let handle = file.as_raw_handle() as HANDLE;
+        use std::os::windows::fs::MetadataExt;
+        if file.metadata()?.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::other("reparse points are not private files"));
+        }
         let (sid, user, token) = current_process_user_sid()?;
         let _keepalive = (user, token);
-        let mut acl = user_only_acl(sid)?;
+        let mut acl = user_only_acl_with_mask_and_flags(
+            sid,
+            windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+            if file.metadata()?.is_dir() { 3 } else { 0 },
+        )?;
         let info = OWNER_SECURITY_INFORMATION
             | GROUP_SECURITY_INFORMATION
             | DACL_SECURITY_INFORMATION
@@ -938,12 +1169,56 @@ mod windows {
         if status != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
-        dacl_is_current_user_only(handle, SE_FILE_OBJECT)
+        dacl_is_current_user_only_with_mask(
+            handle,
+            SE_FILE_OBJECT,
+            windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+        )
+    }
+
+    pub(super) fn assert_private_directory(path: &std::path::Path) -> io::Result<()> {
+        use std::os::windows::{
+            fs::{MetadataExt, OpenOptionsExt},
+            io::AsRawHandle,
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0200_0000 | 0x0020_0000)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::other("private directory required"));
+        }
+        dacl_is_current_user_only_with_mask(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+        )
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn private_files_allow_owner_atomic_replace_and_cleanup_without_widening_pipe_rights() {
+            use std::io::Write;
+            let root = std::env::temp_dir().join(format!("nexus-private-{}", std::process::id()));
+            crate::create_private_directory(&root).unwrap();
+            let original = root.join("original");
+            let renamed = root.join("renamed");
+            let mut file = crate::create_private_file(&original).unwrap();
+            file.write_all(b"public-fixture").unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            assert_eq!(
+                crate::read_private_file(&original, 64).unwrap(),
+                b"public-fixture"
+            );
+            std::fs::rename(&original, &renamed).unwrap();
+            std::fs::remove_file(renamed).unwrap();
+            std::fs::remove_dir(root).unwrap();
+        }
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 

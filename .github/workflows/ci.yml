@@ -1,4 +1,4 @@
-name: Nexus-Ephemera CI (v0.2.0-sealed)
+name: Nexus-Ephemera CI
 
 on:
   push:
@@ -122,7 +122,7 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
         shell: bash
-        run: cargo test --workspace --release -- --test-threads=1 2>&1 | tee outputs/ci-evidence/rust.log
+        run: cargo test --workspace --release --all-features -- --test-threads=1 2>&1 | tee outputs/ci-evidence/rust.log
 
       - name: Run release test suite (including Linux fork & memlock probes)
         if: runner.os == 'Linux'
@@ -131,7 +131,23 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: |
           sudo prlimit --pid=$$ --memlock=unlimited:unlimited
-          cargo test --workspace --release -- --test-threads=1 2>&1 | tee outputs/ci-evidence/rust.log
+          cargo test --workspace --release --all-features -- --test-threads=1 2>&1 | tee outputs/ci-evidence/rust.log
+
+      - name: Verify fresh Unix bootstrap through the native file gate
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export NEXUS_PREFIX="$RUNNER_TEMP/nexus-bootstrap"
+          sh scripts/install_daemon.sh 2>&1 | tee outputs/ci-evidence/bootstrap.log
+
+      - name: Verify fresh Windows bootstrap through the native file gate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:NEXUS_PREFIX = Join-Path $env:RUNNER_TEMP 'nexus-bootstrap'
+          & ./scripts/install_daemon.ps1 2>&1 | Tee-Object outputs/ci-evidence/bootstrap.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Live Python daemon pilot (required on every platform)
         working-directory: clients/python

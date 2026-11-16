@@ -323,6 +323,7 @@ pub struct BrokerDaemon<T> {
     first_instance: bool,
     idempotency: crate::idempotency::IdempotencyCache,
     health_source: Option<std::sync::Arc<dyn HealthSource>>,
+    health_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
@@ -371,8 +372,10 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
         let authority = crate::enterprise_runtime::TenantAuthority::new(directory, secret.0);
         let result = match authority {
             Ok(authority) => {
+                let allowlist = config.allowlist.clone();
                 let admission = tokio::task::spawn_blocking(move || {
                     crate::enterprise_runtime::EnterpriseAdmission::new(authority, store, sink)
+                        .map(|admission| admission.with_daemon_allowlist(allowlist))
                 })
                 .await
                 .map_err(|_| IpcError::Protocol("enterprise startup failed"))?;
@@ -398,33 +401,56 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
         self.health_source = Some(source);
     }
 
-    fn health_report(&self) -> HealthReport {
-        let mut facts = self
-            .health_source
-            .as_ref()
-            .map(|source| source.facts())
-            .unwrap_or(HealthFacts {
-                policy_intact: false,
-                hmac_ready: false,
-                idempotency: "local",
-            });
-        let occupied = if let Some(enterprise) = &self.enterprise {
-            facts.idempotency = match enterprise.probe_store() {
-                Ok(()) => "ready",
-                Err(IpcError::IdempotencyUnavailable) => "degraded",
-                Err(_) => "unhealthy",
+    async fn health_report(&self) -> Result<HealthReport, IpcError> {
+        use std::sync::atomic::Ordering;
+        if self
+            .health_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(IpcError::RateLimited);
+        }
+        struct HealthGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for HealthGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let guard = HealthGuard(self.health_busy.clone());
+        let source = self.health_source.clone();
+        let enterprise = self.enterprise.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let mut facts = source
+                .as_ref()
+                .map(|source| source.facts())
+                .unwrap_or(HealthFacts {
+                    policy_intact: false,
+                    hmac_ready: false,
+                    idempotency: "local",
+                });
+            let occupied = if let Some(enterprise) = enterprise {
+                facts.idempotency = match enterprise.probe_store() {
+                    Ok(()) => "ready",
+                    Err(IpcError::IdempotencyUnavailable) => "degraded",
+                    _ => "unhealthy",
+                };
+                enterprise.worker_occupied()
+            } else {
+                0
             };
-            enterprise.worker_occupied()
-        } else {
-            0
-        };
-        rollup_health(
-            true,
-            occupied,
-            facts.policy_intact,
-            facts.hmac_ready,
-            facts.idempotency,
-        )
+            rollup_health(
+                true,
+                occupied,
+                facts.policy_intact,
+                facts.hmac_ready,
+                facts.idempotency,
+            )
+        });
+        tokio::time::timeout(self.timeout, task)
+            .await
+            .map_err(|_| IpcError::TimedOut)?
+            .map_err(|_| IpcError::Protocol("health worker failed"))
     }
 
     /// Consume the listener and explicitly verify secret cleanup. An outstanding
@@ -492,7 +518,7 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
                 write_response(stream, &outcome, self.max_payload_bytes, self.timeout).await?;
                 return outcome.map(FrameBody::Call);
             }
-            let report = self.health_report();
+            let report = self.health_report().await?;
             let mut encoded = serde_json::to_vec(&report).map_err(|_| IpcError::Malformed)?;
             let written = write_frame(stream, &encoded, self.max_payload_bytes, self.timeout).await;
             encoded.zeroize();
@@ -684,6 +710,7 @@ fn listen<T: SecureTransport + Send + 'static>(
             crate::idempotency::CACHE_CAP,
         ),
         health_source: None,
+        health_busy: Default::default(),
     })
 }
 
@@ -789,6 +816,7 @@ fn listen<T: SecureTransport + Send + 'static>(
             crate::idempotency::CACHE_CAP,
         ),
         health_source: None,
+        health_busy: Default::default(),
     };
     let server = daemon.open_pipe()?;
     daemon.pending = Some(server);
@@ -848,7 +876,6 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
                 IpcError::Malformed
             });
         }
-        resolve_allowlisted_endpoint(&self.allowlist, &request.endpoint)?;
         if let Some(admission) = &self.enterprise {
             use crate::enterprise_runtime::{Admission, TenantCredential};
             use base64::Engine;
@@ -897,6 +924,7 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
                 }
             };
         }
+        resolve_allowlisted_endpoint(&self.allowlist, &request.endpoint)?;
         if request.authorization.is_some() || request.payload.is_some() {
             return Err(IpcError::Protocol(
                 "tenant execution requires enterprise mode",
@@ -1608,7 +1636,11 @@ fn wire_from_outcome(outcome: &Result<TransactionReceipt, IpcError>) -> WireResp
         Err(err) => WireResponse {
             kind: WireKind::Rejected,
             code: code_name(err).to_string(),
-            transport_status: 0,
+            transport_status: if matches!(err, IpcError::RateLimited) {
+                503
+            } else {
+                0
+            },
             seal_report: String::new(),
             binding_digest_hex: String::new(),
             target_endpoint: String::new(),

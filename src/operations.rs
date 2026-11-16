@@ -20,22 +20,25 @@ pub const SHED_STATUS: u16 = 503;
 const GRACE_MAX_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub struct KeyRing {
-    current: Zeroizing<Vec<u8>>,
+    current: crate::apoptosis::EphemeralBuffer,
     previous: Option<PreviousKey>,
 }
 
 struct PreviousKey {
-    secret: Zeroizing<Vec<u8>>,
+    secret: crate::apoptosis::EphemeralBuffer,
     valid_until: u64,
 }
 
 impl KeyRing {
     pub fn new(secret: Vec<u8>) -> Result<Self, IpcError> {
+        let secret = Zeroizing::new(secret);
+        nexus_ephemera_memlock::harden_process_memory().map_err(|_| IpcError::TargetDenied)?;
         if secret.is_empty() || secret.len() > 4096 {
             return Err(IpcError::Malformed);
         }
         Ok(Self {
-            current: Zeroizing::new(secret),
+            current: crate::apoptosis::EphemeralBuffer::from_bytes(&secret)
+                .map_err(|_| IpcError::TargetDenied)?,
             previous: None,
         })
     }
@@ -46,14 +49,21 @@ impl KeyRing {
         now_unix_ms: u64,
         grace: Duration,
     ) -> Result<(), IpcError> {
-        if next.is_empty() || next.len() > 4096 || next.as_slice() == self.current.as_slice() {
+        let next = Zeroizing::new(next);
+        let same = self
+            .current
+            .with_sensitive_bytes(|current| Ok(current == next.as_slice()))
+            .map_err(|_| IpcError::TargetDenied)?;
+        if next.is_empty() || next.len() > 4096 || same {
             return Err(IpcError::Malformed);
         }
         let grace_ms = u64::try_from(grace.as_millis()).map_err(|_| IpcError::Malformed)?;
         if grace_ms > GRACE_MAX_MS {
             return Err(IpcError::Malformed);
         }
-        let retired = std::mem::replace(&mut self.current, Zeroizing::new(next));
+        let replacement = crate::apoptosis::EphemeralBuffer::from_bytes(&next)
+            .map_err(|_| IpcError::TargetDenied)?;
+        let retired = std::mem::replace(&mut self.current, replacement);
         self.previous = if grace_ms == 0 {
             None
         } else {
@@ -71,14 +81,19 @@ impl KeyRing {
         idempotency_key: &str,
         payload_hash: &str,
         endpoint: &str,
-    ) -> String {
-        sign_request_header(
-            &self.current,
-            timestamp_unix_ms,
-            idempotency_key,
-            payload_hash,
-            endpoint,
-        )
+    ) -> Result<String, IpcError> {
+        self.prune_expired(timestamp_unix_ms)?;
+        self.current
+            .with_sensitive_bytes(|key| {
+                Ok(sign_request_header(
+                    key,
+                    timestamp_unix_ms,
+                    idempotency_key,
+                    payload_hash,
+                    endpoint,
+                ))
+            })
+            .map_err(|_| IpcError::TargetDenied)
     }
 
     pub fn verify_request(
@@ -89,31 +104,40 @@ impl KeyRing {
         endpoint: &str,
         now_unix_ms: u64,
     ) -> Result<(), IpcError> {
-        if verify_request_header(
-            &self.current,
-            header,
-            idempotency_key,
-            payload_hash,
-            endpoint,
-            now_unix_ms,
-        )
-        .is_ok()
-        {
-            return Ok(());
-        }
-        if let Some(previous) = &self.previous
-            && now_unix_ms < previous.valid_until
-            && verify_request_header(
-                &previous.secret,
+        self.prune_expired(now_unix_ms)?;
+        let verify = |key: &[u8]| {
+            Ok(verify_request_header(
+                key,
                 header,
                 idempotency_key,
                 payload_hash,
                 endpoint,
                 now_unix_ms,
             )
-            .is_ok()
+            .is_ok())
+        };
+        if self
+            .current
+            .with_sensitive_bytes(verify)
+            .map_err(|_| IpcError::TargetDenied)?
         {
             return Ok(());
+        }
+        if let Some(previous) = &self.previous {
+            if now_unix_ms < previous.valid_until {
+                if previous
+                    .secret
+                    .with_sensitive_bytes(verify)
+                    .map_err(|_| IpcError::TargetDenied)?
+                {
+                    return Ok(());
+                }
+            } else {
+                previous.secret.try_wipe().map_err(|_| {
+                    crate::apoptosis::record_aux_unlock_failure();
+                    IpcError::TargetDenied
+                })?;
+            }
         }
         Err(IpcError::TargetDenied)
     }
@@ -126,13 +150,18 @@ impl KeyRing {
         expires_unix_ms: u64,
         now_unix_ms: u64,
     ) -> Result<String, IpcError> {
-        directory.issue_token(
-            &self.current,
-            service_account_id,
-            role,
-            expires_unix_ms,
-            now_unix_ms,
-        )
+        self.prune_expired(now_unix_ms)?;
+        self.current
+            .with_sensitive_bytes(|key| {
+                Ok(directory.issue_token(
+                    key,
+                    service_account_id,
+                    role,
+                    expires_unix_ms,
+                    now_unix_ms,
+                ))
+            })
+            .map_err(|_| IpcError::TargetDenied)?
     }
 
     pub fn authorize_token(
@@ -143,32 +172,55 @@ impl KeyRing {
         endpoint: &str,
         now_unix_ms: u64,
     ) -> Result<TenantGrant, IpcError> {
-        match directory.authorize(
-            &self.current,
-            token,
-            asserted_account,
-            endpoint,
-            &[],
-            now_unix_ms,
-        ) {
+        self.prune_expired(now_unix_ms)?;
+        let attributes = directory
+            .account_attributes(asserted_account)
+            .ok_or(IpcError::TargetDenied)?;
+        let authorize = |key: &[u8]| {
+            Ok(directory.authorize(
+                key,
+                token,
+                asserted_account,
+                endpoint,
+                attributes,
+                now_unix_ms,
+            ))
+        };
+        match self
+            .current
+            .with_sensitive_bytes(authorize)
+            .map_err(|_| IpcError::TargetDenied)?
+        {
             Ok(grant) => Ok(grant),
             Err(IpcError::TargetDenied) => {
-                if let Some(previous) = &self.previous
-                    && now_unix_ms < previous.valid_until
-                {
-                    return directory.authorize(
-                        &previous.secret,
-                        token,
-                        asserted_account,
-                        endpoint,
-                        &[],
-                        now_unix_ms,
-                    );
+                if let Some(previous) = &self.previous {
+                    if now_unix_ms < previous.valid_until {
+                        return previous
+                            .secret
+                            .with_sensitive_bytes(authorize)
+                            .map_err(|_| IpcError::TargetDenied)?;
+                    }
+                    previous.secret.try_wipe().map_err(|_| {
+                        crate::apoptosis::record_aux_unlock_failure();
+                        IpcError::TargetDenied
+                    })?;
                 }
                 Err(IpcError::TargetDenied)
             }
-            Err(err) => Err(err),
+            Err(error) => Err(error),
         }
+    }
+
+    fn prune_expired(&self, now: u64) -> Result<(), IpcError> {
+        if let Some(previous) = &self.previous
+            && now >= previous.valid_until
+        {
+            previous.secret.try_wipe().map_err(|_| {
+                crate::apoptosis::record_aux_unlock_failure();
+                IpcError::TargetDenied
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -222,11 +274,26 @@ impl TenantQuarantine {
         Ok(())
     }
 
+    /// Call only after authenticating the principal and accepting its policy.
+    pub fn record_success(&self, account: &str) -> Result<(), IpcError> {
+        if !account_ok(account) {
+            return Err(IpcError::Malformed);
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(account);
+        Ok(())
+    }
+
     pub fn record_denial(&self, account: &str, now_unix_ms: u64) -> Result<(), IpcError> {
         if !account_ok(account) {
             return Err(IpcError::Malformed);
         }
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.contains_key(account) && state.len() >= 4096 {
+            return Err(IpcError::IdempotencyUnavailable);
+        }
         let slot = state.entry(account.to_string()).or_insert(TenantState {
             denials: 0,
             blocked_until: None,

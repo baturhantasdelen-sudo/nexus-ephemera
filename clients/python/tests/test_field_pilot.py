@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 
-from nexus_ephemera.adapters.github import GithubIssuePolicy, GithubIssueTransport, IssueProvider, IssueReceipt
+from nexus_ephemera.adapters.github import GithubIssuePolicy, ReferenceGithubIssueTransport, IssueProvider, IssueReceipt
 from nexus_ephemera.enterprise import (
     WORKER_CAP,
     AuditEvent,
@@ -61,7 +61,7 @@ class FieldPilot:
         self._directory = TenantDirectory([
             ServiceAccount(ACCOUNT, (ROLE,), (), (ISSUES,), ((ROLE, (ISSUES,)),)),
         ])
-        self._transport = GithubIssueTransport(policy, b"ghp_field_token_value")
+        self._transport = ReferenceGithubIssueTransport(policy, b"ghp_field_token_value")
         self._call = threading.Lock()
 
     def __repr__(self) -> str:
@@ -140,9 +140,10 @@ def test_field_pilot_denies_foreign_routes_and_reconciles() -> None:
     assert getattr(server, "duplicate_status", None) == 409
     assert failed.creates == 1
     retried = Script("retry")
-    opened_retry = pilot.execute(retried, "POST", ISSUES, "Printer jam", "The queue is stuck", "field-retry", ledger)
-    assert getattr(opened_retry, "duplicate_status", None) is None
-    assert retried.creates == 2
+    import pytest
+    with pytest.raises(Inconclusive):
+        pilot.execute(retried, "POST", ISSUES, "Printer jam", "The queue is stuck", "field-retry", ledger)
+    assert retried.creates == 1
     unknown = Script("unavailable")
     try:
         pilot.execute(unknown, "POST", ISSUES, "Printer jam", "The queue is stuck", "field-unknown", ledger)

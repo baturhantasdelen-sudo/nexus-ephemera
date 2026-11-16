@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..enterprise import DUPLICATE_PROVIDER_STATUS, AuditEvent, AuditLedger
 from ..errors import IdempotencyConflict, Inconclusive, Malformed, TargetDenied
-from ..framing import valid_idempotency_key
+from ..framing import valid_idempotency_key, load_json_object
 
 _POLICY_PATH = Path(__file__).resolve().parents[5] / "policies" / "pilot_support_agent.json"
 _MARKER = "<!-- nexus-idempotency:{key} -->"
@@ -24,8 +26,14 @@ class GithubIssuePolicy:
 
     @classmethod
     def load(cls, raw: bytes | None = None) -> GithubIssuePolicy:
-        payload = json.loads((raw if raw is not None else _POLICY_PATH.read_bytes()).decode("utf-8"))
-        if not isinstance(payload, dict):
+        data = raw if raw is not None else _POLICY_PATH.read_bytes()
+        if not data or len(data) > 65536:
+            raise Malformed()
+        payload = load_json_object(bytearray(data))
+        if not isinstance(payload, dict) or set(payload) != {
+            "role", "service_account_id", "provider", "method", "owner", "repo",
+            "endpoint", "allowed_fields", "denied_capabilities",
+        }:
             raise Malformed()
         if (
             payload.get("role") != "support_agent"
@@ -40,6 +48,12 @@ class GithubIssuePolicy:
         fields = payload.get("allowed_fields")
         denied = payload.get("denied_capabilities")
         if not isinstance(owner, str) or not isinstance(repo, str) or not isinstance(endpoint, str):
+            raise Malformed()
+        if any(not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}", name) or name.endswith(".") for name in (owner, repo)):
+            raise Malformed()
+        if not isinstance(fields, list) or not all(isinstance(value, str) for value in fields):
+            raise Malformed()
+        if not isinstance(denied, list) or not all(isinstance(value, str) for value in denied):
             raise Malformed()
         expected = f"https://api.github.com/repos/{owner}/{repo}/issues"
         if endpoint != expected or sorted(fields or []) != ["body", "title"]:
@@ -71,8 +85,11 @@ class IssueProvider:
         raise NotImplementedError
 
 
-class GithubIssueTransport:
-    """Broker-side issue transport. ``Debug`` text does not include the token."""
+class ReferenceGithubIssueTransport:
+    """Reference-only scripted transport; not durable and not a production broker.
+
+    Production agents use TenantClient.execute_payload; only Rust owns secrets.
+    """
 
     def __init__(self, policy: GithubIssuePolicy, token: bytes) -> None:
         if not token or len(token) > 256 or b"Bearer " in token or any(byte < 0x21 or byte > 0x7E for byte in token):
@@ -80,9 +97,10 @@ class GithubIssueTransport:
         self._policy = policy
         self._token = token
         self._slots: dict[str, IssueReceipt | None] = {}
+        self._lock = threading.RLock()
 
     def __repr__(self) -> str:
-        return f"GithubIssueTransport(endpoint={self._policy.endpoint!r})"
+        return f"ReferenceGithubIssueTransport(endpoint={self._policy.endpoint!r})"
 
     def prepare(self, title: str, body: str, idempotency_key: str) -> tuple[bytes, str]:
         if not valid_idempotency_key(idempotency_key) or not _field(title, 256, False) or not _field(body, 8192, True):
@@ -105,6 +123,24 @@ class GithubIssueTransport:
         return self.open_issue(provider, fields["title"], fields["body"], idempotency_key, ledger)
 
     def open_issue(
+        self, provider: IssueProvider, title: str, body: str,
+        idempotency_key: str, ledger: AuditLedger,
+    ) -> IssueReceipt:
+        # Atomic claim, dispatch and audit for this reference instance only.
+        failure: type[Malformed] | type[Inconclusive] | type[IdempotencyConflict] = Inconclusive
+        with self._lock:
+            try:
+                return self._open_issue(provider, title, body, idempotency_key, ledger)
+            except Malformed:
+                failure = Malformed
+            except IdempotencyConflict:
+                failure = IdempotencyConflict
+            except Exception:
+                failure = Inconclusive
+        # Raise after the handler: no chained exception retains provider data.
+        raise failure()
+
+    def _open_issue(
         self,
         provider: IssueProvider,
         title: str,
@@ -128,16 +164,19 @@ class GithubIssueTransport:
             )
         if idempotency_key in self._slots:
             raise Inconclusive()
+        if len(self._slots) >= 1024:
+            raise Inconclusive()
         self._slots[idempotency_key] = None
+        ledger.append(AuditEvent("retained", self._policy.service_account_id,
+            self._policy.endpoint, payload_hash, idempotency_key, "retained", "", 0))
         try:
             receipt = self._resolve(provider, raw, payload_hash, idempotency_key)
         except Malformed:
-            self._slots.pop(idempotency_key, None)
+            self._slots[idempotency_key] = None
             raise
         except Inconclusive:
             self._slots[idempotency_key] = None
             raise
-        self._slots[idempotency_key] = receipt
         ledger.append(
             AuditEvent(
                 "audit_v2",
@@ -150,6 +189,7 @@ class GithubIssueTransport:
                 receipt.transport_status,
             )
         )
+        self._slots[idempotency_key] = receipt
         return receipt
 
     def _resolve(
@@ -168,14 +208,8 @@ class GithubIssueTransport:
         found = provider.find(idempotency_key)
         if found == "found":
             return _receipt(self._policy.endpoint, payload_hash, idempotency_key, 201, DUPLICATE_PROVIDER_STATUS)
-        if found != "missing":
-            raise Inconclusive()
-        created = provider.create(body, idempotency_key, b"Bearer " + self._token)
-        if created == "created":
-            return _receipt(self._policy.endpoint, payload_hash, idempotency_key, 201, None)
-        if provider.find(idempotency_key) == "found":
-            return _receipt(self._policy.endpoint, payload_hash, idempotency_key, 201, DUPLICATE_PROVIDER_STATUS)
         raise Inconclusive()
+
 
 
 def _receipt(

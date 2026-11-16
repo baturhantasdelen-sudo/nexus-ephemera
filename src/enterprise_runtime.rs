@@ -68,6 +68,21 @@ impl TenantAuthority {
             .map_err(|_| IpcError::TargetDenied)?
     }
 
+    fn authenticate(&self, proof: &TenantCredential) -> Result<(), IpcError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| IpcError::TargetDenied)?;
+        let now = u64::try_from(now.as_millis()).map_err(|_| IpcError::TargetDenied)?;
+        self.key
+            .with_sensitive_bytes(|key| {
+                Ok(self
+                    .directory
+                    .authenticate(key, &proof.token, &proof.account, now)
+                    .map(|_| ()))
+            })
+            .map_err(|_| IpcError::TargetDenied)?
+    }
+
     fn verify(
         &self,
         proof: &TenantCredential,
@@ -115,12 +130,12 @@ impl TenantAuthority {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BoundPayload {
-    tool: Parameter,
-    params: BoundParams,
+pub(crate) struct BoundPayload {
+    pub(crate) tool: Parameter,
+    pub(crate) params: BoundParams,
 }
 
-enum Parameter {
+pub(crate) enum Parameter {
     Text(Zeroizing<String>),
     Integer,
 }
@@ -159,7 +174,7 @@ impl<'de> Deserialize<'de> for Parameter {
     }
 }
 
-struct BoundParams(std::collections::BTreeMap<String, Parameter>);
+pub(crate) struct BoundParams(pub(crate) std::collections::BTreeMap<String, Parameter>);
 impl<'de> Deserialize<'de> for BoundParams {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ParamsVisitor;
@@ -451,39 +466,72 @@ pub trait CheckpointSink: Send + Sync {
 /// A caller must place this path in its separately trusted anchor store.
 pub struct FileCheckpointSink {
     path: std::path::PathBuf,
-    last: Mutex<Option<u64>>,
+    last: Mutex<Option<CommittedCheckpoint>>,
+    writer: Mutex<Option<std::fs::File>>,
+}
+struct CommittedCheckpoint {
+    checkpoint: AuditCheckpoint,
+    checkpoint_hash: [u8; 32],
+    export_hash: [u8; 32],
 }
 impl FileCheckpointSink {
     pub fn new(path: std::path::PathBuf) -> Self {
         Self {
             path,
             last: Mutex::new(None),
+            writer: Mutex::new(None),
         }
     }
 }
 impl CheckpointSink for FileCheckpointSink {
     fn store(&self, checkpoint: &AuditCheckpoint, exported: &str) -> Result<(), IpcError> {
         use std::io::Write;
+        nexus_ephemera_ipc_os::assert_private_directory(
+            self.path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        )?;
         let mut last = self.last.try_lock().map_err(|_| IpcError::RateLimited)?;
+        let mut writer = self.writer.try_lock().map_err(|_| IpcError::RateLimited)?;
+        if writer.is_none() {
+            *writer = Some(nexus_ephemera_ipc_os::create_private_file(
+                &self.path.with_extension("writer.lock"),
+            )?);
+        }
         if last.is_none() && self.path.exists() {
             return Err(IpcError::Protocol(
                 "checkpoint stream already exists; choose a new stream path",
             ));
         }
-        if last.is_some_and(|previous| previous.checked_add(1) != Some(checkpoint.records)) {
+        if last.as_ref().is_some_and(|previous| {
+            previous.checkpoint.records.checked_add(1) != Some(checkpoint.records)
+        }) {
             return Err(IpcError::Protocol("checkpoint sequence is not monotonic"));
+        }
+        // Compare the committed files with our in-memory trusted anchor before
+        // replacing them. Never silently repair a truncated or rewritten log.
+        if let Some(previous) = last.as_ref() {
+            let committed = nexus_ephemera_ipc_os::read_private_file(&self.path, 1024)?;
+            let export = nexus_ephemera_ipc_os::read_private_file(
+                &self.path.with_extension("audit.json"),
+                1024 * 1024,
+            )?;
+            if <[u8; 32]>::from(Sha256::digest(&committed)) != previous.checkpoint_hash
+                || <[u8; 32]>::from(Sha256::digest(&export)) != previous.export_hash
+                || !std::str::from_utf8(&export)
+                    .is_ok_and(|text| crate::enterprise::verify_export(text, &previous.checkpoint))
+            {
+                return Err(IpcError::Protocol("committed audit stream was modified"));
+            }
+        }
+        if !crate::enterprise::verify_export(exported, checkpoint) {
+            return Err(IpcError::Protocol("invalid audit checkpoint"));
         }
         let temporary = self
             .path
             .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
+        let mut file = nexus_ephemera_ipc_os::create_private_file(&temporary)?;
         let content = serde_json::json!({"head":hex(&checkpoint.head),"merkle_root":hex(&checkpoint.merkle_root),"records":checkpoint.records});
         file.write_all(content.to_string().as_bytes())?;
         file.sync_all()?;
@@ -492,14 +540,7 @@ impl CheckpointSink for FileCheckpointSink {
         let export_temporary = self
             .path
             .with_extension(format!("{}.audit.tmp", uuid::Uuid::new_v4()));
-        let mut export_options = std::fs::OpenOptions::new();
-        export_options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            export_options.mode(0o600);
-        }
-        let mut export = export_options.open(&export_temporary)?;
+        let mut export = nexus_ephemera_ipc_os::create_private_file(&export_temporary)?;
         export.write_all(exported.as_bytes())?;
         export.sync_all()?;
         drop(export);
@@ -510,7 +551,11 @@ impl CheckpointSink for FileCheckpointSink {
             let parent = self.path.parent().ok_or(IpcError::Malformed)?;
             std::fs::File::open(parent)?.sync_all()?;
         }
-        *last = Some(checkpoint.records);
+        *last = Some(CommittedCheckpoint {
+            checkpoint: checkpoint.clone(),
+            checkpoint_hash: Sha256::digest(content.to_string().as_bytes()).into(),
+            export_hash: Sha256::digest(exported.as_bytes()).into(),
+        });
         Ok(())
     }
 }
@@ -522,6 +567,9 @@ pub struct EnterpriseAdmission {
     gate: Arc<WorkerGate>,
     audit: Mutex<AuditLedger>,
     sink: Arc<dyn CheckpointSink>,
+    quarantine: crate::operations::TenantQuarantine,
+    started: std::time::Instant,
+    daemon_allowlist: Option<Vec<String>>,
 }
 
 impl EnterpriseAdmission {
@@ -540,7 +588,15 @@ impl EnterpriseAdmission {
             sink,
             gate: Arc::new(WorkerGate::new()),
             audit: Mutex::new(audit),
+            quarantine: crate::operations::TenantQuarantine::new(3, Duration::from_secs(30))?,
+            started: std::time::Instant::now(),
+            daemon_allowlist: None,
         })
+    }
+
+    pub(crate) fn with_daemon_allowlist(mut self, allowlist: Vec<String>) -> Self {
+        self.daemon_allowlist = Some(allowlist);
+        self
     }
 
     pub fn worker_occupied(&self) -> usize {
@@ -606,6 +662,7 @@ impl EnterpriseAdmission {
         hash: &str,
         key: &str,
     ) -> Result<Admission, IpcError> {
+        let _lifecycle = crate::apoptosis::acquire_permit().map_err(|_| IpcError::TargetDenied)?;
         let permit = self.gate.try_acquire_owned()?;
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(IpcError::TargetDenied);
@@ -617,7 +674,22 @@ impl EnterpriseAdmission {
         {
             return Err(IpcError::Malformed);
         }
-        if let Err(error) = self.authority.verify(proof, endpoint, payload) {
+        // No unverified account string may charge another tenant's quarantine.
+        self.authority.authenticate(proof)?;
+        let monotonic_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.quarantine.ensure(&proof.account, monotonic_ms)?;
+        let verified = if self
+            .daemon_allowlist
+            .as_ref()
+            .is_some_and(|allowed| !allowed.iter().any(|item| item == endpoint))
+        {
+            Err(IpcError::TargetDenied)
+        } else {
+            self.authority.verify(proof, endpoint, payload)
+        };
+        if let Err(error) = verified {
+            self.quarantine
+                .record_denial(&proof.account, monotonic_ms)?;
             self.note(
                 AuditKind::TargetDenied,
                 "rejected",
@@ -628,6 +700,7 @@ impl EnterpriseAdmission {
             )?;
             return Err(error);
         }
+        self.quarantine.record_success(&proof.account)?;
         let store_id = digest_parts(&[&proof.account, key]);
         let fingerprint = digest_parts(&[endpoint, hash]);
         let call = VerifiedCall {
@@ -826,6 +899,21 @@ impl HttpPayloadTransport {
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+
+    pub(crate) fn client(&self) -> Result<reqwest::blocking::Client, BrokerError> {
+        let mut builder = reqwest::blocking::Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(self.timeout);
+        if let Some(root) = &self.root {
+            builder = builder.tls_certs_only([root.clone()]);
+        }
+        builder
+            .build()
+            .map_err(|_| BrokerError::Transport("provider client unavailable"))
+    }
 }
 impl SecureTransport for HttpPayloadTransport {
     fn dispatch(&mut self, _: &AuthorizedCall<'_>) -> Result<TransportReply, BrokerError> {
@@ -838,6 +926,8 @@ impl SecureTransport for HttpPayloadTransport {
         call: &AuthorizedCall<'_>,
         payload: &[u8],
     ) -> Result<TransportReply, BrokerError> {
+        let _lifecycle = crate::apoptosis::acquire_permit()
+            .map_err(|_| BrokerError::Transport("provider lifecycle closed"))?;
         strict_service_target(call.target_endpoint)
             .map_err(|_| BrokerError::Transport("provider target denied"))?;
         if call.payload_hash != hex(&Sha256::digest(payload)) {
@@ -846,6 +936,7 @@ impl SecureTransport for HttpPayloadTransport {
         let mut builder = reqwest::blocking::Client::builder()
             .https_only(true)
             .no_proxy()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(self.timeout);
         if let Some(root) = &self.root {
