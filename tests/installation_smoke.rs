@@ -17,7 +17,14 @@ use nexus_ephemera::packaging::{self, policy_tag};
 
 #[test]
 fn clean_install_serves_health_and_opens_one_issue() {
-    let root = std::env::temp_dir().join(format!("nexus-pkg-{}", uuid::Uuid::new_v4()));
+    // Darwin's TMPDIR may already consume most of sockaddr_un.sun_path.
+    // Keep the socket's textual path short, without canonicalizing /tmp.
+    #[cfg(target_os = "macos")]
+    let base = std::path::PathBuf::from("/tmp");
+    #[cfg(not(target_os = "macos"))]
+    let base = std::env::temp_dir();
+    let root = base.join(format!("nx-{}", uuid::Uuid::new_v4().simple()));
+    nexus_ephemera_ipc_os::create_private_directory(&root).expect("private fixture root");
     let package = root.join("package");
     let runtime_dir = root.join("run");
     fs::create_dir_all(&runtime_dir).expect("runtime dir");
@@ -118,6 +125,34 @@ fn clean_install_serves_health_and_opens_one_issue() {
     assert_eq!(provider.creates, 1);
     assert!(!ledger.export_json().contains("ghp_install_token"));
     let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn long_macos_tmpdir_does_not_break_private_socket_installation() {
+    let root =
+        std::path::PathBuf::from("/tmp").join(format!("nx-long-{}", uuid::Uuid::new_v4().simple()));
+    let long_temp = root.join("long-darwin-temp-parent".repeat(6));
+    nexus_ephemera_ipc_os::create_private_directory(&long_temp).unwrap();
+    assert!(long_temp.as_os_str().len() > 104);
+    // Change only the child environment, never this process's shared TMPDIR.
+    // The child runs the complete socket/health/provider smoke test.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "clean_install_serves_health_and_opens_one_issue",
+            "--nocapture",
+        ])
+        .env("TMPDIR", &long_temp)
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        output.status.success(),
+        "long TMPDIR installation failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn serve_health(
