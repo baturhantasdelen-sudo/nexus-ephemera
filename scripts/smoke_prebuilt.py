@@ -13,7 +13,10 @@ def main() -> None:
     a=p.parse_args()
     # macOS SUN_LEN requires a short socket path even when TMPDIR is long.
     with tempfile.TemporaryDirectory(prefix="nx-", dir="/tmp" if "apple" in a.target else None) as tmp:
-        root=Path(tmp)
+        # Canonicalize only the temporary directory we just created. macOS
+        # exposes /tmp and /var through aliases; user-supplied installer paths
+        # must still pass the strict no-indirection policy unchanged.
+        root=Path(tmp).resolve(strict=True)
         binary=root/"bin"
         install(a.archive,hashlib.sha256(a.archive.read_bytes()).hexdigest(),a.target,binary)
         daemon=binary/("nexus-daemon.exe" if "windows" in a.target else "nexus-daemon")

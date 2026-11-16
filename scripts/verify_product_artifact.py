@@ -18,7 +18,7 @@ def main() -> None:
         raise RuntimeError("unsupported release test host")
     tag = "v" + tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     with tempfile.TemporaryDirectory(prefix="nx-artifact-") as tmp:
-        archive = package(tag, target, root / "target/release", Path(tmp))
+        archive = package(tag, target, root / "target/release", Path(tmp).resolve(strict=True))
         subprocess.run([sys.executable, str(root / "scripts/smoke_prebuilt.py"), "--archive", str(archive), "--target", target], check=True, timeout=90)
 
 

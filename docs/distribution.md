@@ -34,6 +34,10 @@ parses, rejects extra/duplicate/traversal/link members and wrong architecture,
 and never overwrites an installation. On Windows use an operator-managed private
 installation parent; secret package DACLs are enforced by the native daemon.
 No secrets, services or provider calls are provisioned by this installer.
+Use an explicitly canonical installation/evidence path. On macOS, `/tmp` and
+`/var` are system aliases; the smoke tools resolve their OWN newly-created
+temporary roots before validation. User-provided symlink/junction parents remain
+rejected by the installer and evidence checker.
 
 Existing install_daemon.sh/.ps1 are SOURCE bootstrap tools requiring Rust; they
 are not network binary installers. Native package provisioning:
