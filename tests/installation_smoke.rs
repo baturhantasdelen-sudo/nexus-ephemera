@@ -17,8 +17,7 @@ use nexus_ephemera::packaging::{self, policy_tag};
 
 #[test]
 fn clean_install_serves_health_and_opens_one_issue() {
-    let root = std::env::temp_dir().join(format!("nexus-pkg-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = std::env::temp_dir().join(format!("nexus-pkg-{}", uuid::Uuid::new_v4()));
     let package = root.join("package");
     let runtime_dir = root.join("run");
     fs::create_dir_all(&runtime_dir).expect("runtime dir");
@@ -39,6 +38,20 @@ fn clean_install_serves_health_and_opens_one_issue() {
         packaging::load(&package).is_err(),
         "loose package must fail closed"
     );
+    #[cfg(unix)]
+    {
+        assert!(
+            packaging::seal(&package).is_err(),
+            "seal must not repair loose inputs"
+        );
+        assert!(!package.join("hmac.key").exists());
+        assert!(!package.join("policy.hmac").exists());
+    }
+    // Permission repair is a separate, explicit operator action.
+    for name in ["config.toml", ".env", "pilot_support_agent.json"] {
+        nexus_ephemera_ipc_os::lock_file_to_current_user(&package.join(name))
+            .expect("restore private permissions");
+    }
     packaging::seal(&package).expect("seal");
     let loaded = packaging::load(&package).expect("sealed package");
     assert_eq!(
@@ -46,7 +59,8 @@ fn clean_install_serves_health_and_opens_one_issue() {
         "https://api.github.com/repos/pilot-org/support-queue/issues"
     );
     let mut broken = fs::read(package.join("policy.hmac")).expect("hmac");
-    broken[..2].copy_from_slice(b"00");
+    // Always change a byte: overwriting with 00 occasionally leaves the tag intact.
+    broken[0] = if broken[0] == b'0' { b'1' } else { b'0' };
     fs::write(package.join("policy.hmac"), &broken).expect("tamper");
     assert!(
         packaging::load(&package).is_err(),

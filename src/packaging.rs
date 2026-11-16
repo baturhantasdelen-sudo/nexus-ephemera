@@ -112,6 +112,19 @@ pub fn write_template(directory: &Path, listen: &str, policy: &[u8]) -> Result<(
 
 pub fn seal(directory: &Path) -> Result<(), IpcError> {
     nexus_ephemera_ipc_os::assert_private_directory(directory)?;
+    // Sealing signs a private package; it is not a permission-repair API.
+    // Check all existing inputs before creating a key or replacing a tag.
+    // symlink_metadata also catches dangling optional-file symlinks.
+    for name in FILES {
+        let path = directory.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => nexus_ephemera_ipc_os::assert_private_file(&path)?,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && matches!(name, "hmac.key" | "policy.hmac") => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     let policy = read_capped(&directory.join("pilot_support_agent.json"))?;
     let key_path = directory.join("hmac.key");
     if !key_path.exists() {
@@ -128,9 +141,6 @@ pub fn seal(directory: &Path) -> Result<(), IpcError> {
         fs::remove_file(&signature_path)?;
     }
     write_new(&signature_path, hex(&tag).as_bytes())?;
-    for name in FILES {
-        nexus_ephemera_ipc_os::lock_file_to_current_user(&directory.join(name))?;
-    }
     load(directory).map(|_| ())
 }
 

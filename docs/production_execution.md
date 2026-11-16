@@ -96,6 +96,10 @@ Unix package directories require service ownership and 0700; files require
 files are created private, not written and chmodded afterwards. Reads bound
 the bytes and validate the same opened handle; leaf symlinks/reparse points
 are rejected. Keep the full parent hierarchy under trusted administration.
+`--seal` requires all existing package files to be private before it creates
+or replaces anything. It does not repair permissions. An authorized operator
+must correct ownership/permissions explicitly, then retry sealing. This also
+applies to an existing `hmac.key` or `policy.hmac`; rejection preserves them.
 The Python package checker is a POSIX convenience validator; Windows fails
 closed and uses the Rust `--check` command for authoritative DACL validation.
 
