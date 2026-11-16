@@ -44,13 +44,18 @@ class ReleasePackagingTests(unittest.TestCase):
                 archive = m.package("v0.2.1", target, self.binaries(root, target), dist)
                 if "windows" in target:
                     with zipfile.ZipFile(archive) as z:
-                        self.assertEqual(set(z.namelist()), {n + ".exe" for n in m.BINARIES})
+                        self.assertEqual(set(z.namelist()), {n + ".exe" for n in m.BINARIES} | {"LICENSE"})
                 else:
                     with tarfile.open(archive) as t:
-                        self.assertEqual(set(t.getnames()), set(m.BINARIES))
+                        self.assertEqual(set(t.getnames()), set(m.BINARIES) | {"LICENSE"})
+            (dist / "nexus_ephemera_py-0.2.1-py3-none-any.whl").write_bytes(b"wheel fixture")
+            (dist / "nexus_ephemera_py-0.2.1.tar.gz").write_bytes(b"sdist fixture")
+            (dist / "cargo-sbom.cdx.json").write_text("{}")
+            (dist / "LICENSE").write_text("MIT")
+            m.kit(Path(__file__).resolve().parents[2], dist)
             manifest = m.checksums("v0.2.1", dist)
             lines = manifest.read_text().splitlines()
-            self.assertEqual(len(lines), 3)
+            self.assertEqual(len(lines), 8)
             for line in lines:
                 digest, name = line.split("  ")
                 self.assertEqual(digest, hashlib.sha256((dist / name).read_bytes()).hexdigest())
@@ -73,3 +78,17 @@ class ReleasePackagingTests(unittest.TestCase):
                 m.checksums("v0.2.1", root / "empty")
             with self.assertRaises(ValueError):
                 m.archive_name("v1/../../escape", target)
+
+    def test_version_mismatch_cannot_publish(self):
+        root=Path(__file__).resolve().parents[2]
+        with self.assertRaises(ValueError):
+            m.validate_version("v999.0.0",root)
+
+    def test_pilot_kit_contains_no_runtime_secrets_or_live_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive=m.kit(Path(__file__).resolve().parents[2],Path(tmp))
+            with zipfile.ZipFile(archive) as z:
+                names=z.namelist()
+                self.assertIn("docs/operator_recovery.md",names)
+                self.assertIn("scripts/install_prebuilt.py",names)
+                self.assertFalse(any(n.endswith((".env",".key",".secret")) or n.startswith("outputs/") for n in names))

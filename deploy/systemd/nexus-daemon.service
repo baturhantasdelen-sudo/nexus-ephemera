@@ -1,0 +1,36 @@
+# Reference Linux pilot unit. Review paths and identity before installation.
+# Same-UID agents require a separate sandbox/mount and egress boundary.
+[Unit]
+Description=Nexus Ephemera controlled execution broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexus
+Group=nexus
+UMask=0077
+WorkingDirectory=/var/lib/nexus
+ExecStartPre=/opt/nexus/bin/nexus-daemon --package /var/lib/nexus/package --check
+ExecStart=/opt/nexus/bin/nexus-daemon --package /var/lib/nexus/package --enterprise-config /var/lib/nexus/enterprise.json
+StandardInput=file:/var/lib/nexus/broker.secret
+StandardOutput=journal
+StandardError=journal
+# Local audit streams cannot be reused after restart. Recovery is deliberate.
+Restart=no
+KillSignal=SIGTERM
+TimeoutStopSec=150
+LimitMEMLOCK=67108864
+LimitCORE=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/nexus
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=96
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

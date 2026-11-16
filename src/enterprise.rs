@@ -97,6 +97,16 @@ pub struct AuditCheckpoint {
 }
 
 impl AuditLedger {
+    /// Numeric readiness only; does not expose audit contents or reserve space.
+    pub fn can_append_records(&self, count: usize) -> bool {
+        !self.closed
+            && self
+                .records
+                .len()
+                .checked_add(count)
+                .is_some_and(|n| n <= AUDIT_CAPACITY)
+    }
+
     pub fn try_new() -> Result<Self, IpcError> {
         Ok(Self {
             closed: false,

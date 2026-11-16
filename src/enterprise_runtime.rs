@@ -220,6 +220,17 @@ impl Drop for TenantAuthority {
     }
 }
 
+/// Diagnostic state only. `Recorded` is not a successful seal assertion;
+/// `Missing` is not proof that an external side effect never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    Missing,
+    Pending,
+    Inconclusive,
+    Recorded,
+}
+
 /// The backend is a trust dependency. Provision explicitly, never on reconnect.
 /// Plaintext TCP is restricted to literal loopback; remote backends require TLS.
 pub struct RedisIdempotency {
@@ -372,6 +383,46 @@ redis.call('HSET',KEYS[1],'_schema',ARGV[1],'_sealed','0','_fence','0','_capacit
             return Err(IpcError::IdempotencyUnavailable);
         }
         Ok(())
+    }
+
+    /// Operator-only, read-only status. Never returns payloads, tokens or receipts,
+    /// and never changes a claim or authorizes a retry. The caller must enforce
+    /// operator identity; this API is intentionally not exposed on agent IPC.
+    pub fn inspect_operation(
+        &self,
+        account: &str,
+        request_key: &str,
+    ) -> Result<OperationState, IpcError> {
+        let _permit = crate::apoptosis::acquire_permit().map_err(|_| IpcError::TargetDenied)?;
+        if account.is_empty()
+            || account.len() > 256
+            || request_key.is_empty()
+            || request_key.len() > 256
+        {
+            return Err(IpcError::Malformed);
+        }
+        let mut connection = self.connection()?;
+        let state: String = redis::cmd("EVAL")
+            .arg(r#"
+if redis.call('HGET',KEYS[1],'_schema') ~= ARGV[1] or redis.call('HGET',KEYS[1],'_capacity') ~= ARGV[3] then return 'unavailable' end
+local raw=redis.call('HGET',KEYS[1],ARGV[2])
+if not raw then return 'missing' end
+if string.len(raw)>16384 then return 'invalid' end
+local ok,e=pcall(cjson.decode,raw)
+if not ok or type(e)~='table' then return 'invalid' end
+if e.state=='pending' or e.state=='inconclusive' or e.state=='done' then return e.state end
+return 'invalid'
+"#)
+            .arg(1).arg(&self.key).arg(SCHEMA)
+            .arg(digest_parts(&[account, request_key])).arg(self.capacity)
+            .query(&mut connection).map_err(|_| IpcError::IdempotencyUnavailable)?;
+        match state.as_str() {
+            "missing" => Ok(OperationState::Missing),
+            "pending" => Ok(OperationState::Pending),
+            "inconclusive" => Ok(OperationState::Inconclusive),
+            "done" => Ok(OperationState::Recorded),
+            _ => Err(IpcError::IdempotencyUnavailable),
+        }
     }
 
     pub fn quarantine_for_rotation(&self) -> Result<(), IpcError> {
@@ -604,6 +655,16 @@ impl EnterpriseAdmission {
     }
 
     pub fn probe_store(&self) -> Result<(), IpcError> {
+        let _permit = crate::apoptosis::acquire_permit().map_err(|_| IpcError::TargetDenied)?;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .audit
+                .try_lock()
+                .map_err(|_| IpcError::RateLimited)?
+                .can_append_records(2)
+        {
+            return Err(IpcError::Protocol("enterprise admission is not ready"));
+        }
         self.store.health()
     }
 

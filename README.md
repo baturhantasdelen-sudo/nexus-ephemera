@@ -25,3 +25,11 @@ On Linux, the test shell must be able to raise `RLIMIT_MEMLOCK` before `cargo te
 Remediation lifecycle guarantees and release/deployment acceptance gates are documented in [docs/production_acceptance.md](docs/production_acceptance.md). Rust 1.95+ is required.
 
 Enterprise mode is explicit: `--enterprise-config` enables mandatory server-side tenant/action/payload validation, durable Redis claims and verified HTTPS forwarding. The default CLI remains a local reference provider. Framework helpers execute the remote operation themselves; they are not permission slips for a second local dispatch. See the enterprise runbook for token-policy and audit-v2 API migration, mandatory real-backend CI, and independently retained checkpoint requirements. `Reference*` stores are models and are not distributed/HA evidence.
+
+## Design partner and product delivery
+
+Start with the [product contract](docs/product_contract.md), [pilot kit](docs/design_partner_pilot.md),
+[verified distribution](docs/distribution.md), [operator recovery](docs/operator_recovery.md)
+and [commercial proposal](docs/commercial_model.md). The evidence checker starts
+blocked; it never substitutes CI for customer or independent acceptance.
+`nexus-operator` is a privileged read-only diagnostic tool, not an agent retry API.

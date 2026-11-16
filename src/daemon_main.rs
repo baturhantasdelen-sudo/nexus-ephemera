@@ -156,6 +156,13 @@ fn run() -> Result<(), IpcError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    #[cfg(unix)]
+    let (mut terminate, mut interrupt) = runtime.block_on(async {
+        Ok::<_, std::io::Error>((
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+        ))
+    })?;
     let mut daemon = if let Some(path) = args.enterprise_path {
         let parent = path
             .parent()
@@ -244,7 +251,17 @@ fn run() -> Result<(), IpcError> {
     stdout.flush().map_err(IpcError::from)?;
     drop(stdout);
     let served = runtime.block_on(async {
-        let shutdown = tokio::signal::ctrl_c();
+        let shutdown = async {
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = interrupt.recv() => Ok::<(), std::io::Error>(()),
+                    _ = terminate.recv() => Ok(()),
+                }
+            }
+            #[cfg(not(unix))]
+            tokio::signal::ctrl_c().await
+        };
         tokio::pin!(shutdown);
         let mut connections = 0u64;
         loop {

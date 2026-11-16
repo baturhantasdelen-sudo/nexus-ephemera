@@ -31,6 +31,26 @@ const DENIED_TARGETS: [&str; 5] = [
 ];
 
 #[tokio::test]
+async fn operator_rejection_never_echoes_untrusted_arguments() {
+    let canary = "operator-argument-must-not-appear";
+    let output = Command::new(env!("CARGO_BIN_EXE_nexus-operator"))
+        .args([
+            "inspect",
+            "nonexistent-private-config",
+            canary,
+            "nonexistent-key",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains(canary));
+    assert!(stderr.contains("operator inspection denied or unavailable"));
+}
+
+#[tokio::test]
 async fn release_daemon_binds_a_private_endpoint_and_denies_foreign_targets() {
     let listen = unique_listen();
     // Exactly one endpoint inspection, one successful call, and the denials.
@@ -816,4 +836,46 @@ fn dial(
     write.map_err(|_| "write failed")?;
     let raw = read_http(&mut stream);
     status_code(&raw).ok_or("status missing")
+}
+
+/// SIGTERM is the normal service-manager stop path. A killed process cannot
+/// promise a wipe; the graceful path must positively report completion.
+#[cfg(unix)]
+#[tokio::test]
+async fn service_sigterm_drains_and_reports_complete() {
+    let listen = unique_listen();
+    let mut child = Command::new(daemon_exe())
+        .args(["--listen", &listen, "--reference-mode", "--allow", ALLOWED])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(SECRET).await.unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .as_deref(),
+        Some("ready")
+    );
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().unwrap().to_string())
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+    let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("shutdown seal=complete"));
 }

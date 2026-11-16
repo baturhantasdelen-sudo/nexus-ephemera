@@ -11,3 +11,9 @@ __pycache__/
 *.egg-info/
 .venv/
 dist/
+
+# Local bootstrap state and real pilot evidence must never enter source control.
+/var/
+/pilot/evidence/
+**/.env
+*.secret

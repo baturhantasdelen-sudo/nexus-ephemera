@@ -1,6 +1,6 @@
 # Security policy
 
-`nexus-ephemera` 0.2.0 provides **Sensitive-Memory Lifecycle Protection**: verified wiping of managed buffers and bounded retention of those buffers. It does not claim a zero footprint, and it does not claim that secret bytes are gone from hardware.
+`nexus-ephemera` 0.3.0-rc.1 provides **Sensitive-Memory Lifecycle Protection**: verified wiping of managed buffers and bounded retention of those buffers. It does not claim a zero footprint, and it does not claim that secret bytes are gone from hardware.
 
 ## Guarantee boundary
 
@@ -23,17 +23,20 @@ A failed unlock quarantines the buffer and does not report success. `Partial` an
 
 Report suspected vulnerabilities in private. Do not open a public issue, pull request, or discussion that contains exploit detail, proof-of-concept code, or secret material.
 
-Use the repository host's private security advisory form (GitHub: **Security → Report a vulnerability**). That form is the supported private channel. Do not send the report to a public issue tracker. A monitored email address is not published in this tree; maintainers who add one should list it here and keep the public-issue ban.
+Use the repository host's private security advisory form (GitHub: **Security â†’ Report a vulnerability**). That form is the supported private channel. Do not send the report to a public issue tracker. A monitored email address is not published in this tree; maintainers who add one should list it here and keep the public-issue ban.
 
 Include the affected version, operating system and architecture, whether the issue is inside a managed buffer, and the smallest description that lets a maintainer reproduce it. Do not send live credentials.
 
 We aim to acknowledge a report within 3 business days and to send a status update within 10 business days. Fixes ship on the supported version line below. Please give the maintainers time to publish a fix before any public write-up.
 
-## Supported versions
+## Version and support scope
 
-| Version | Security fixes |
-| --- | --- |
-| 0.2.x | Supported. 0.2.0 is the sealed release. |
-| Older than 0.2.0 | Not supported. |
+Current source is 0.3.0-rc.1, a remediation/productization candidate, not a sealed
+customer release or a formal certification. Report candidate vulnerabilities via
+the private channel above. A commercial support commitment requires an explicit
+agreement; historical sealed tags do not prove fixes are backported. Do not use
+the 0.2 line as the current enterprise execution contract.
 
-Only the 0.2 line receives security fixes. A report against an unsupported version may still be useful, and it will not receive a backport.
+See docs/product_contract.md and docs/distribution.md for current deployment
+boundaries. Same-UID agent code must be sandboxed from broker files and process
+memory. Adversarial customer evidence is required; a green CI matrix is insufficient.

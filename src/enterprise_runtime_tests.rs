@@ -586,3 +586,55 @@ fn https_transport_sends_exact_body_and_preserves_real_failure_status() {
     );
     worker.join().unwrap();
 }
+
+#[test]
+#[ignore = "requires dedicated Redis with AOF always/noeviction"]
+fn redis_operator_inspection_cannot_release_or_cross_tenant_claims() {
+    let _guard = crate::apoptosis::test_serial();
+    crate::apoptosis::reset_coordinator_for_tests();
+    let store = redis_fixture(&format!("inspect-{}", uuid::Uuid::new_v4()), 8);
+    store.provision().unwrap();
+    let call = fixture_call("lost-ack");
+    assert_eq!(
+        store.inspect_operation("fixture", "lost-ack").unwrap(),
+        OperationState::Missing
+    );
+    let Claim::Leader(fence) = store.claim(&call).unwrap() else {
+        panic!("leader");
+    };
+    assert_eq!(
+        store.inspect_operation("fixture", "lost-ack").unwrap(),
+        OperationState::Pending
+    );
+    assert_eq!(
+        store.inspect_operation("other", "lost-ack").unwrap(),
+        OperationState::Missing
+    );
+    assert!(matches!(store.claim(&call), Err(IpcError::Inconclusive)));
+    store.finish(&call, &fence, None).unwrap();
+    assert_eq!(
+        store.inspect_operation("fixture", "lost-ack").unwrap(),
+        OperationState::Inconclusive
+    );
+    assert!(matches!(store.claim(&call), Err(IpcError::Inconclusive)));
+    store.quarantine_for_rotation().unwrap();
+    assert_eq!(
+        store.inspect_operation("fixture", "lost-ack").unwrap(),
+        OperationState::Inconclusive
+    );
+    crate::apoptosis::trigger_apoptosis().unwrap();
+    assert!(store.inspect_operation("fixture", "lost-ack").is_err());
+    crate::apoptosis::reset_coordinator_for_tests();
+}
+
+#[test]
+fn audit_readiness_rejects_closed_or_overflowing_record_requests() {
+    let _guard = crate::apoptosis::test_serial();
+    crate::apoptosis::reset_coordinator_for_tests();
+    let mut audit = AuditLedger::try_new().unwrap();
+    assert!(audit.can_append_records(2));
+    assert!(!audit.can_append_records(usize::MAX));
+    audit.close().unwrap();
+    assert!(!audit.can_append_records(0));
+    assert!(!audit.can_append_records(2));
+}

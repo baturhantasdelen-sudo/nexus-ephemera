@@ -5,7 +5,10 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: '2'
 
 concurrency:
   group: release-${{ github.ref }}
@@ -18,12 +21,12 @@ jobs:
   build:
     needs: validate
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -38,26 +41,76 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
+      - name: Bind tag to Rust and SDK versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/package_release.py validate-version --tag "$RELEASE_TAG"
+        shell: bash
       - name: Build only distributable binaries
-        run: cargo build --locked --release --bin nexus-daemon --bin nexus-ephemera --target ${{ matrix.target }}
+        run: cargo build --locked --release --bin nexus-daemon --bin nexus-ephemera --bin nexus-operator --target ${{ matrix.target }}
+      - name: Enforce Linux glibc 2.39 deployment floor
+        if: runner.os == 'Linux'
+        run: python scripts/check_linux_abi.py target/${{ matrix.target }}/release
       - name: Verify architecture and package explicit binaries
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_TARGET: ${{ matrix.target }}
         run: python scripts/package_release.py package --tag "$RELEASE_TAG" --target "$RELEASE_TARGET"
         shell: bash
+      - name: Execute installed archive and reject package tampering
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(python -c 'import sys; sys.path.insert(0,"scripts"); from package_release import archive_name; print(archive_name(sys.argv[1],sys.argv[2]))' "$RELEASE_TAG" "$RELEASE_TARGET")
+          python scripts/smoke_prebuilt.py --archive "dist/$archive" --target "$RELEASE_TARGET"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
+  sdk:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+      - name: Build SDK and inventory, install wheel outside checkout
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -r scripts/release-requirements.txt
+          python scripts/package_release.py validate-version --tag "$RELEASE_TAG"
+          python -m build --no-isolation clients/python --outdir dist
+          python scripts/package_release.py sbom --tag "$RELEASE_TAG"
+          python scripts/package_release.py kit --tag "$RELEASE_TAG"
+          cp LICENSE dist/LICENSE
+          python scripts/verify_wheel.py dist/*.whl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-sdk
+          path: dist/*
+          if-no-files-found: error
+
   release:
-    needs: [validate, build]
+    needs: [validate, build, sdk]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -72,6 +125,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python scripts/package_release.py checksums --tag "$RELEASE_TAG"
+      - name: Attest every published artifact and checksum manifest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/*
       - name: Publish once without overwriting an existing release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -83,6 +140,8 @@ jobs:
             echo "Release already exists; refusing to overwrite its assets."
             exit 1
           fi
-          gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes --title "$RELEASE_TAG"
+          prerelease=false
+          if [[ "$RELEASE_TAG" == *-* ]]; then prerelease=true; fi
+          gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease="$prerelease" --generate-notes --title "$RELEASE_TAG"
           gh release upload "$RELEASE_TAG" dist/*
-          gh release edit "$RELEASE_TAG" --draft=false
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$prerelease"

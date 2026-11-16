@@ -71,3 +71,12 @@ Production acceptance additionally requires real customer/provider retry tests, 
 - An audit sink that cannot persist blocks dispatch. The provider counter stays at zero until the sink accepts the checkpoint.
 - Telemetry export is the audit-v2 document plus its Merkle root. `verify_export` rejects a changed kind. The export must not contain signing secrets, provider tokens, or issue bodies.
 
+
+## Product lifecycle and customer pilot
+
+The current assurance boundaries are in product_contract.md. See operator_recovery.md
+for read-only uncertainty inspection, explicit drain/restart rotation, audit rollover,
+backup/rollback rules and metrics. distribution.md distinguishes source bootstrap
+from verified prebuilt installation and documents the Linux reference service unit.
+design_partner_pilot.md and pilot/acceptance.template.json require real customer,
+external-anchor, failover and independent-review evidence before promotion.

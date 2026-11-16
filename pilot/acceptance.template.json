@@ -1,0 +1,116 @@
+{
+  "schema": "nexus-pilot-v1",
+  "commit": "REPLACE_WITH_FULL_COMMIT",
+  "gates": {
+    "same_commit_ci": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "release_provenance": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "clean_install": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "agent_secret_isolation": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "agent_egress_isolation": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "policy_denials": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "lost_ack": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "same_key_concurrency": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "restart_recovery": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "redis_failover_topology": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "audit_before_dispatch": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "audit_after_dispatch": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "external_audit_anchor": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "audit_rotation": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "credential_rotation_revocation": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "graceful_shutdown": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "load_capacity": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "backup_restore": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "upgrade_rollback": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "operator_reconciliation": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "independent_review": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    },
+    "customer_acceptance": {
+      "status": "pending",
+      "evidence": null,
+      "sha256": null
+    }
+  }
+}

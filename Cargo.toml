@@ -6,7 +6,7 @@ members = [".", "crates/memlock", "crates/ipc_os"]
 version = "0.3.0-rc.1"
 edition = "2024"
 license = "MIT"
-authors = ["Baturhan Taşdelen <baturhantasdelen@gmail.com>"]
+authors = ["Baturhan TaÅŸdelen <baturhantasdelen@gmail.com>"]
 repository = "https://github.com/baturhantasdelen-sudo/nexus-ephemera"
 keywords = [
     "sensitive-memory",
@@ -33,7 +33,11 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 description = "Sensitive-memory lifecycle protection for offline scout, AEAD mesh, and brokered agent calls"
-exclude = ["crates/memlock/**", "crates/ipc_os/**", ".github/**"]
+exclude = [
+    "crates/memlock/**", "crates/ipc_os/**", ".github/**",
+    "outputs/**", "var/**", "dist/**", "pilot/evidence/**",
+    "**/.env", "**/*.secret", "**/*.key",
+]
 
 [lib]
 name = "nexus_ephemera"
@@ -46,6 +50,10 @@ path = "src/main.rs"
 [[bin]]
 name = "nexus-daemon"
 path = "src/daemon_main.rs"
+
+[[bin]]
+name = "nexus-operator"
+path = "src/operator_main.rs"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -81,7 +89,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 tokio = { version = "1.0", features = ["rt", "macros"] }
 zeroize = "1.7"
 
-# Üretim ikilisi: LTO + strip; panik unwind (apoptosis catch_unwind).
+# Ãœretim ikilisi: LTO + strip; panik unwind (apoptosis catch_unwind).
 [profile.release]
 opt-level = 3
 lto = "fat"

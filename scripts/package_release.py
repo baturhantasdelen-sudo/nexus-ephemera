@@ -3,13 +3,58 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import json
+import tomllib
+import subprocess
+import sys
 import struct
 import tarfile
 import zipfile
 from pathlib import Path
 
 TARGETS = ("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin")
-BINARIES = ("nexus-daemon", "nexus-ephemera")
+BINARIES = ("nexus-daemon", "nexus-ephemera", "nexus-operator")
+
+def validate_version(tag: str, root: Path) -> None:
+    rust = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
+    sdk = tomllib.loads((root / "clients/python/pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    if tag != "v" + rust or sdk != rust:
+        raise ValueError("tag, Rust and Python source versions must match exactly")
+
+def sbom(root: Path, output: Path) -> None:
+    # Resolved Cargo inventory, including dev/build dependencies, not a runtime
+    # reachability assertion. No environment, secrets or private source paths.
+    result = subprocess.run(["cargo", "metadata", "--locked", "--format-version", "1"], cwd=root,
+                            check=True, capture_output=True, text=True)
+    packages = json.loads(result.stdout)["packages"]
+    components = []
+    for p in sorted(packages, key=lambda p: (p["name"], p["version"])):
+        component = {"type": "library", "name": p["name"], "version": p["version"],
+                     "purl": f"pkg:cargo/{p['name']}@{p['version']}"}
+        if p.get("license"):
+            component["licenses"] = [{"expression": p["license"]}]
+        components.append(component)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.6", "version": 1,
+                                 "components": components}, indent=2) + "\n", encoding="utf-8")
+
+def kit(root: Path, dist: Path) -> Path:
+    # Explicit allowlist: never include config, .env, tokens or pilot evidence.
+    files = ["LICENSE", "SECURITY.md", "docs/product_contract.md", "docs/design_partner_pilot.md",
+             "docs/operator_recovery.md", "docs/distribution.md", "docs/commercial_model.md", "docs/productization_status.md",
+             "docs/production_execution.md", "docs/enterprise_runbooks.md", "docs/platform_support.md",
+             "pilot/acceptance.template.json", "deploy/systemd/nexus-daemon.service",
+             "scripts/install_prebuilt.py", "scripts/package_release.py", "scripts/pilot_gate.py",
+             "scripts/probe_daemon.py"]
+    dist.mkdir(parents=True, exist_ok=True)
+    archive = dist / "nexus-pilot-kit.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for name in files:
+            file = root / name
+            if file.is_symlink() or not file.is_file():
+                raise ValueError("missing pilot kit source")
+            z.write(file, name)
+    return archive
 
 def archive_name(tag: str, target: str) -> str:
     if not re.fullmatch(r"v[0-9A-Za-z][0-9A-Za-z._+-]{0,127}", tag) or target not in TARGETS:
@@ -43,6 +88,10 @@ def package(tag: str, target: str, binary_dir: Path, dist: Path) -> Path:
     files = [binary_dir / (name + suffix) for name in BINARIES]
     for file in files:
         require_architecture(file, target)
+    license_file = Path(__file__).resolve().parents[1] / "LICENSE"
+    if license_file.is_symlink() or not license_file.is_file():
+        raise ValueError("missing distribution license")
+    files.append(license_file)
     dist.mkdir(parents=True, exist_ok=True)
     archive = dist / name
     if suffix:
@@ -57,6 +106,8 @@ def package(tag: str, target: str, binary_dir: Path, dist: Path) -> Path:
 
 def checksums(tag: str, dist: Path) -> Path:
     expected = {archive_name(tag, target) for target in TARGETS}
+    version = tag.removeprefix("v").replace("-rc.", "rc")
+    expected |= {f"nexus_ephemera_py-{version}-py3-none-any.whl", f"nexus_ephemera_py-{version}.tar.gz", "cargo-sbom.cdx.json", "LICENSE", "nexus-pilot-kit.zip"}
     actual = {p.name for p in dist.iterdir() if p.name != "checksums.txt"}
     if actual != expected:
         raise ValueError("release requires exactly one archive for every target")
@@ -74,13 +125,19 @@ def checksums(tag: str, dist: Path) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument("command", choices=("package", "checksums"))
+    parser.add_argument("command", choices=("package", "checksums", "validate-version", "sbom", "kit"))
     parser.add_argument("--tag", required=True)
     parser.add_argument("--target", choices=TARGETS)
     parser.add_argument("--binary-dir", type=Path)
     parser.add_argument("--dist", type=Path, default=Path("dist"))
     args = parser.parse_args()
-    if args.command == "package":
+    if args.command == "validate-version":
+        validate_version(args.tag, Path(__file__).resolve().parents[1])
+    elif args.command == "kit":
+        print(kit(Path(__file__).resolve().parents[1], args.dist))
+    elif args.command == "sbom":
+        sbom(Path(__file__).resolve().parents[1], args.dist / "cargo-sbom.cdx.json")
+    elif args.command == "package":
         if not args.target:
             parser.error("--target is required for package")
         directory = args.binary_dir or Path("target") / args.target / "release"
