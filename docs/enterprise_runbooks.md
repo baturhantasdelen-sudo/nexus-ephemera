@@ -55,3 +55,15 @@ A mandatory 32-slot owned RAII gate bounds server admission; the 33rd is rejecte
 Required checks: fmt, all-feature Clippy with warnings denied, release workspace tests, pytest and strict mypy. The additional enterprise-redis CI job runs actual AOF Redis with separate processes, crash/Pending, fences, cached Partial, conflicts, capacity, quarantine and missing-namespace checks. Ignored backend tests are explicitly selected there; locally skipped tests are not backend proof.
 
 Production acceptance additionally requires real customer/provider retry tests, Redis restart/failover/data-loss drills, independently retained audit anchors and Linux/macOS/Windows evidence for the exact commit. Local test success alone is not enterprise certification. Same-user IPC is an account boundary, not isolation from every same-user process, container namespace or privileged host administrator. Managed-memory guarantees exclude arbitrary Python/TLS/kernel buffers, registers and hardware attacks. Disable exception logging that captures secret local variables.
+
+## Day-2 drills
+
+`cargo test --test operations_resilience` exercises the local drills below. They do not replace the enterprise-redis CI job.
+
+- Rotate the broker signing key and the tenant HMAC key with a grace window. The new key signs the next request immediately. The retired key verifies only until the grace instant, then returns `TargetDenied`. An unknown or expired key returns `TargetDenied`. The request MAC canonical input is unchanged.
+- Fill all 32 worker permits. The 33rd admission is rejected and reported as HTTP 503. Releasing a permit admits one more caller.
+- Three `TargetDenied` observations quarantine that tenant until the block interval ends. The block does not delete Pending or Inconclusive idempotency records.
+- A Redis outage is closed as `Inconclusive`. The error text is static and does not include a URL, token, or broker secret. Do not mint a new business key to retry it.
+- An audit sink that cannot persist blocks dispatch. The provider counter stays at zero until the sink accepts the checkpoint.
+- Telemetry export is the audit-v2 document plus its Merkle root. `verify_export` rejects a changed kind. The export must not contain signing secrets, provider tokens, or issue bodies.
+

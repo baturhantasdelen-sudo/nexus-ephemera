@@ -14,6 +14,35 @@ pub fn current_uid() -> io::Result<u32> {
     u32::try_from(uid).map_err(|_| io::Error::other("uid does not fit u32"))
 }
 
+#[cfg(unix)]
+pub fn assert_private_file(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    if !meta.file_type().is_file() || meta.nlink() != 1 {
+        return Err(io::Error::other("package file must be a regular file"));
+    }
+    if meta.mode() & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "package file must be mode 0600",
+        ));
+    }
+    if meta.uid() != current_uid()? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "package file owner mismatch",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn lock_file_to_current_user(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    assert_private_file(path)
+}
+
 /// Exclusive PID lock for a daemon listen socket.
 ///
 /// The lock file is `<socket>.lock`. `flock` provides mutual exclusion. Drop
@@ -868,6 +897,50 @@ mod windows {
         }
     }
 
+    pub fn assert_private_file(path: &std::path::Path) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        let meta = std::fs::metadata(path)?;
+        if !meta.is_file() {
+            return Err(io::Error::other("package file must be a regular file"));
+        }
+        let file = std::fs::File::open(path)?;
+        dacl_is_current_user_only(file.as_raw_handle() as HANDLE, SE_FILE_OBJECT)
+    }
+
+    pub fn lock_file_to_current_user(path: &std::path::Path) -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+            )
+            .open(path)?;
+        let handle = file.as_raw_handle() as HANDLE;
+        let (sid, user, token) = current_process_user_sid()?;
+        let _keepalive = (user, token);
+        let mut acl = user_only_acl(sid)?;
+        let info = OWNER_SECURITY_INFORMATION
+            | GROUP_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | PROTECTED_DACL_SECURITY_INFORMATION;
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                info,
+                sid,
+                sid,
+                acl.as_mut_ptr(),
+                ptr::null(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        dacl_is_current_user_only(handle, SE_FILE_OBJECT)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1143,7 +1216,7 @@ mod windows {
 
 #[cfg(windows)]
 pub use windows::{
-    PipePeer, StdinPoll, assert_pipe_dacl_is_current_user_only, cancel_thread_id,
-    create_user_only_pipe, current_thread_id, lock_pipe_to_current_user, pipe_peer,
-    pipe_server_peer, poll_stdin_read,
+    PipePeer, StdinPoll, assert_pipe_dacl_is_current_user_only, assert_private_file,
+    cancel_thread_id, create_user_only_pipe, current_thread_id, lock_file_to_current_user,
+    lock_pipe_to_current_user, pipe_peer, pipe_server_peer, poll_stdin_read,
 };

@@ -220,6 +220,45 @@ def parse_call(
     raise Malformed()
 
 
+def parse_health(value: object) -> dict[str, object]:
+    """Accept a health frame. It has no secret, endpoint, or payload field."""
+
+    mapping = _object_map(value)
+    expected = {
+        "kind",
+        "status",
+        "ipc_listening",
+        "worker_occupied",
+        "worker_capacity",
+        "policy_intact",
+        "hmac_ready",
+        "idempotency",
+    }
+    if set(mapping) != expected or _text(_required(mapping, "kind")) != "health":
+        raise Malformed()
+    status = _text(_required(mapping, "status"))
+    idempotency = _text(_required(mapping, "idempotency"))
+    if status not in {"healthy", "degraded", "unhealthy"}:
+        raise Malformed()
+    if idempotency not in {"local", "ready", "degraded", "unhealthy"}:
+        raise Malformed()
+    occupied = _u16(_required(mapping, "worker_occupied"))
+    capacity = _u16(_required(mapping, "worker_capacity"))
+    if capacity != 32 or not isinstance(mapping["ipc_listening"], bool):
+        raise Malformed()
+    if not isinstance(mapping["policy_intact"], bool) or not isinstance(mapping["hmac_ready"], bool):
+        raise Malformed()
+    return {
+        "status": status,
+        "ipc_listening": mapping["ipc_listening"],
+        "worker_occupied": occupied,
+        "worker_capacity": capacity,
+        "policy_intact": mapping["policy_intact"],
+        "hmac_ready": mapping["hmac_ready"],
+        "idempotency": idempotency,
+    }
+
+
 def parse_metrics(value: object) -> MetricsSnapshot:
     """Accept a metrics frame and return only the five counters."""
 

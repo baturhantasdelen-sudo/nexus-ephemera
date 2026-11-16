@@ -327,7 +327,13 @@ class _Permit:
 
 
 def canonical_event(event: AuditEvent, key: bytes | bytearray) -> bytes:
-    if event.kind not in {"receipt", "target_denied", "idempotency_conflict", "retained"}:
+    if event.kind not in {
+        "receipt",
+        "target_denied",
+        "idempotency_conflict",
+        "retained",
+        "audit_v2",
+    }:
         raise Malformed()
     if not _ident(event.service_account_id):
         raise Malformed()
@@ -401,7 +407,13 @@ def verify_export(exported: str, trusted: AuditCheckpoint) -> bool:
             event = record["event"]
             if not isinstance(event, dict) or set(event) != event_fields:
                 return False
-            if event["kind"] not in {"receipt", "retained", "target_denied", "idempotency_conflict"}:
+            if event["kind"] not in {
+                "receipt",
+                "retained",
+                "target_denied",
+                "idempotency_conflict",
+                "audit_v2",
+            }:
                 return False
             if type(event["transport_status"]) is not int or not 0 <= event["transport_status"] <= 65535:
                 return False

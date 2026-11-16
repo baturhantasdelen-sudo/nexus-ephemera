@@ -543,6 +543,14 @@ impl EnterpriseAdmission {
         })
     }
 
+    pub fn worker_occupied(&self) -> usize {
+        self.gate.occupied()
+    }
+
+    pub fn probe_store(&self) -> Result<(), IpcError> {
+        self.store.health()
+    }
+
     pub fn export_audit(&self) -> Result<String, IpcError> {
         Ok(self
             .audit
@@ -813,6 +821,10 @@ impl HttpPayloadTransport {
     pub fn with_ca_der(mut self, der: &[u8]) -> Result<Self, IpcError> {
         self.root = Some(reqwest::Certificate::from_der(der).map_err(|_| IpcError::Malformed)?);
         Ok(self)
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 impl SecureTransport for HttpPayloadTransport {

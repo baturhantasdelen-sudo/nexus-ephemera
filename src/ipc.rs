@@ -204,6 +204,65 @@ impl DaemonConfig {
     }
 }
 
+/// Package and backend facts for one health answer. The broker secret is not a field.
+pub trait HealthSource: Send + Sync {
+    fn facts(&self) -> HealthFacts;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthFacts {
+    pub policy_intact: bool,
+    pub hmac_ready: bool,
+    pub idempotency: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthReport {
+    pub kind: String,
+    pub status: String,
+    pub ipc_listening: bool,
+    pub worker_occupied: u16,
+    pub worker_capacity: u16,
+    pub policy_intact: bool,
+    pub hmac_ready: bool,
+    pub idempotency: String,
+}
+
+pub fn rollup_health(
+    ipc_listening: bool,
+    worker_occupied: usize,
+    policy_intact: bool,
+    hmac_ready: bool,
+    idempotency: &str,
+) -> HealthReport {
+    let occupied = u16::try_from(worker_occupied).unwrap_or(u16::MAX);
+    let known = matches!(idempotency, "local" | "ready" | "degraded" | "unhealthy");
+    let status = if !ipc_listening
+        || !policy_intact
+        || !hmac_ready
+        || !known
+        || idempotency == "unhealthy"
+        || worker_occupied > crate::enterprise::WORKER_CAP
+    {
+        "unhealthy"
+    } else if idempotency == "degraded" || worker_occupied == crate::enterprise::WORKER_CAP {
+        "degraded"
+    } else {
+        "healthy"
+    };
+    HealthReport {
+        kind: "health".to_string(),
+        status: status.to_string(),
+        ipc_listening,
+        worker_occupied: occupied,
+        worker_capacity: u16::try_from(crate::enterprise::WORKER_CAP).unwrap_or(u16::MAX),
+        policy_intact,
+        hmac_ready,
+        idempotency: idempotency.to_string(),
+    }
+}
+
 pub struct LocalAcceptTransport;
 
 impl SecureTransport for LocalAcceptTransport {
@@ -230,6 +289,9 @@ pub enum ServedCall {
         receipt: TransactionReceipt,
     },
     Metrics {
+        peer_pid: u32,
+    },
+    Health {
         peer_pid: u32,
     },
 }
@@ -260,6 +322,7 @@ pub struct BrokerDaemon<T> {
     #[cfg(windows)]
     first_instance: bool,
     idempotency: crate::idempotency::IdempotencyCache,
+    health_source: Option<std::sync::Arc<dyn HealthSource>>,
 }
 
 impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
@@ -331,6 +394,39 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
         result
     }
 
+    pub fn set_health_source(&mut self, source: std::sync::Arc<dyn HealthSource>) {
+        self.health_source = Some(source);
+    }
+
+    fn health_report(&self) -> HealthReport {
+        let mut facts = self
+            .health_source
+            .as_ref()
+            .map(|source| source.facts())
+            .unwrap_or(HealthFacts {
+                policy_intact: false,
+                hmac_ready: false,
+                idempotency: "local",
+            });
+        let occupied = if let Some(enterprise) = &self.enterprise {
+            facts.idempotency = match enterprise.probe_store() {
+                Ok(()) => "ready",
+                Err(IpcError::IdempotencyUnavailable) => "degraded",
+                Err(_) => "unhealthy",
+            };
+            enterprise.worker_occupied()
+        } else {
+            0
+        };
+        rollup_health(
+            true,
+            occupied,
+            facts.policy_intact,
+            facts.hmac_ready,
+            facts.idempotency,
+        )
+    }
+
     /// Consume the listener and explicitly verify secret cleanup. An outstanding
     /// provider is uncertain, even if managed secret cleanup succeeds.
     pub fn shutdown(mut self) -> Result<crate::broker::SealReport, IpcError> {
@@ -357,6 +453,7 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
         match result? {
             FrameBody::Call(receipt) => Ok(ServedCall::Call { peer_pid, receipt }),
             FrameBody::Metrics => Ok(ServedCall::Metrics { peer_pid }),
+            FrameBody::Health => Ok(ServedCall::Health { peer_pid }),
         }
     }
 
@@ -388,6 +485,19 @@ impl<T: SecureTransport + Send + 'static> BrokerDaemon<T> {
             encoded.zeroize();
             written?;
             return Ok(FrameBody::Metrics);
+        }
+        if request.op == WireOp::Health {
+            if !bare_probe(&request) {
+                let outcome = Err(IpcError::Malformed);
+                write_response(stream, &outcome, self.max_payload_bytes, self.timeout).await?;
+                return outcome.map(FrameBody::Call);
+            }
+            let report = self.health_report();
+            let mut encoded = serde_json::to_vec(&report).map_err(|_| IpcError::Malformed)?;
+            let written = write_frame(stream, &encoded, self.max_payload_bytes, self.timeout).await;
+            encoded.zeroize();
+            written?;
+            return Ok(FrameBody::Health);
         }
         let outcome = self.dispatch_bounded(&request).await;
         if let Err(err) =
@@ -573,6 +683,7 @@ fn listen<T: SecureTransport + Send + 'static>(
             config.idempotency_ttl,
             crate::idempotency::CACHE_CAP,
         ),
+        health_source: None,
     })
 }
 
@@ -677,6 +788,7 @@ fn listen<T: SecureTransport + Send + 'static>(
             config.idempotency_ttl,
             crate::idempotency::CACHE_CAP,
         ),
+        health_source: None,
     };
     let server = daemon.open_pipe()?;
     daemon.pending = Some(server);
@@ -698,6 +810,7 @@ impl<T> Drop for BrokerDaemon<T> {
 enum FrameBody {
     Call(TransactionReceipt),
     Metrics,
+    Health,
 }
 
 fn note_auth_failure(err: IpcError) -> IpcError {
@@ -1148,6 +1261,54 @@ impl NexusClient {
         parsed.into_snapshot()
     }
 
+    pub async fn health(&self) -> Result<HealthReport, IpcError> {
+        let deadline = std::time::Instant::now() + self.timeout;
+        let mut last = IpcError::TimedOut;
+        while std::time::Instant::now() < deadline {
+            match self.health_once().await {
+                Ok(report) => return Ok(report),
+                Err(err) if connection_retry(&err) => {
+                    last = err;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last)
+    }
+
+    async fn health_once(&self) -> Result<HealthReport, IpcError> {
+        let request = WireRequest {
+            op: WireOp::Health,
+            authorization: None,
+            payload: None,
+            endpoint: String::new(),
+            payload_hash: String::new(),
+            idempotency_key: String::new(),
+        };
+        let mut body = serde_json::to_vec(&request).map_err(|_| IpcError::Malformed)?;
+        let mut stream = connect_once(&self.listen).await?;
+        let write = write_frame(&mut stream, &body, self.max_payload_bytes, self.timeout).await;
+        body.zeroize();
+        write?;
+        let mut response = read_frame(&mut stream, self.max_payload_bytes, self.timeout).await?;
+        let parsed: HealthReport =
+            serde_json::from_slice(&response).map_err(|_| IpcError::Malformed)?;
+        response.zeroize();
+        let _ = stream.shutdown().await;
+        if parsed.kind != "health"
+            || parsed.worker_capacity != u16::try_from(crate::enterprise::WORKER_CAP).unwrap_or(0)
+            || !matches!(parsed.status.as_str(), "healthy" | "degraded" | "unhealthy")
+            || !matches!(
+                parsed.idempotency.as_str(),
+                "local" | "ready" | "degraded" | "unhealthy"
+            )
+        {
+            return Err(IpcError::Malformed);
+        }
+        Ok(parsed)
+    }
+
     async fn attempt(
         &self,
         endpoint: &str,
@@ -1311,6 +1472,7 @@ enum WireOp {
     #[default]
     Call,
     Metrics,
+    Health,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1488,6 +1650,14 @@ fn parse_seal(name: &str) -> Option<SealReport> {
     }
 }
 
+fn bare_probe(request: &WireRequest) -> bool {
+    request.endpoint.is_empty()
+        && request.payload_hash.is_empty()
+        && request.idempotency_key.is_empty()
+        && request.authorization.is_none()
+        && request.payload.is_none()
+}
+
 fn code_name(err: &IpcError) -> &'static str {
     match err {
         IpcError::TargetDenied => "target_denied",
@@ -1528,7 +1698,7 @@ pub fn fuzz_wire_request(bytes: &[u8]) -> bool {
         return false;
     }
     serde_json::from_slice::<WireRequest>(bytes).is_ok_and(|r| match r.op {
-        WireOp::Metrics => {
+        WireOp::Metrics | WireOp::Health => {
             r.endpoint.is_empty() && r.payload_hash.is_empty() && r.idempotency_key.is_empty()
         }
         WireOp::Call => {

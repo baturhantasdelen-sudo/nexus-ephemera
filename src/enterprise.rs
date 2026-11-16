@@ -32,6 +32,7 @@ pub enum AuditKind {
     TargetDenied,
     IdempotencyConflict,
     Retained,
+    AuditV2,
 }
 
 impl AuditKind {
@@ -41,6 +42,7 @@ impl AuditKind {
             Self::TargetDenied => "target_denied",
             Self::IdempotencyConflict => "idempotency_conflict",
             Self::Retained => "retained",
+            Self::AuditV2 => "audit_v2",
         }
     }
 
@@ -50,6 +52,7 @@ impl AuditKind {
             "target_denied" => Some(Self::TargetDenied),
             "idempotency_conflict" => Some(Self::IdempotencyConflict),
             "retained" => Some(Self::Retained),
+            "audit_v2" => Some(Self::AuditV2),
             _ => None,
         }
     }
@@ -735,6 +738,10 @@ impl WorkerGate {
         Self {
             inflight: AtomicUsize::new(0),
         }
+    }
+
+    pub fn occupied(&self) -> usize {
+        self.inflight.load(Ordering::SeqCst)
     }
 
     pub fn try_acquire(&self) -> Result<WorkerPermit<'_>, IpcError> {

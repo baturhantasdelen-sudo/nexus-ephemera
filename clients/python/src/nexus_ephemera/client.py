@@ -31,6 +31,7 @@ from .framing import (
     encode_request,
     load_json_object,
     parse_call,
+    parse_health,
     parse_metrics,
     validate_call,
     wipe,
@@ -98,6 +99,14 @@ class NexusClient:
 
         async def once() -> MetricsSnapshot:
             return await self._metrics_once()
+
+        return await self._within_budget(once)
+
+    async def health(self) -> dict[str, object]:
+        """Read the broker health frame. The frame carries no secret."""
+
+        async def once() -> dict[str, object]:
+            return await self._health_once()
 
         return await self._within_budget(once)
 
@@ -180,6 +189,16 @@ class NexusClient:
         finally:
             wipe(body)
         return parse_metrics(parsed)
+
+    async def _health_once(self) -> dict[str, object]:
+        body = encode_request("health", "", "", "")
+        try:
+            if len(body) > self._max_payload:
+                raise PayloadTooLarge(self._max_payload)
+            parsed = await self._exchange(body)
+        finally:
+            wipe(body)
+        return parse_health(parsed)
 
     async def _exchange(self, body: bytearray) -> object:
         try:

@@ -21,6 +21,10 @@ struct LaunchArgs {
     config: DaemonConfig,
     max_connections: Option<u64>,
     enterprise_path: Option<std::path::PathBuf>,
+    package_dir: Option<std::path::PathBuf>,
+    listen_explicit: bool,
+    seal_package: bool,
+    check_package: bool,
     provision_store: bool,
     issue_token: Option<(String, String, u64)>,
 }
@@ -86,7 +90,37 @@ fn main() -> ExitCode {
 fn run() -> Result<(), IpcError> {
     harden_before_secret()?;
     let args = parse_args(std::env::args().skip(1))?;
-    let config = args.config;
+    if let Some(dir) = &args.package_dir {
+        if args.seal_package {
+            nexus_ephemera::packaging::seal(dir)?;
+        }
+        if args.check_package || args.seal_package {
+            let _loaded = nexus_ephemera::packaging::load(dir)?;
+            println!("package-ok");
+            return Ok(());
+        }
+    } else if args.seal_package || args.check_package {
+        return Err(IpcError::Protocol("package directory is required"));
+    }
+    let mut config = args.config;
+    let package = args
+        .package_dir
+        .as_ref()
+        .map(|dir| nexus_ephemera::packaging::load(dir))
+        .transpose()?;
+    if let Some(package) = &package {
+        if args.listen_explicit && config.listen != package.listen() {
+            return Err(IpcError::Protocol("listen does not match the package"));
+        }
+        if !config.allowlist.is_empty() {
+            return Err(IpcError::Protocol(
+                "package config already sets the allowlist",
+            ));
+        }
+        config.listen = package.listen().to_string();
+        config.allowlist = vec![package.allow().to_string()];
+        config.timeout = package.timeout();
+    }
     let max_connections = args.max_connections;
     let mut secret = read_secret(config.timeout)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -148,6 +182,9 @@ fn run() -> Result<(), IpcError> {
             DaemonTransport::Local(LocalAcceptTransport),
         ))?
     };
+    if let Some(package) = package {
+        daemon.set_health_source(package.watch());
+    }
     drop(secret);
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "ready").map_err(IpcError::from)?;
@@ -168,7 +205,8 @@ fn run() -> Result<(), IpcError> {
             connections += 1;
             match outcome {
                 Ok(nexus_ephemera::ipc::ServedCall::Call { peer_pid, .. })
-                | Ok(nexus_ephemera::ipc::ServedCall::Metrics { peer_pid }) => {
+                | Ok(nexus_ephemera::ipc::ServedCall::Metrics { peer_pid })
+                | Ok(nexus_ephemera::ipc::ServedCall::Health { peer_pid }) => {
                     eprintln!("peer_ok pid={peer_pid}");
                 }
                 Err(err) if nexus_ephemera::ipc::per_connection(&err) => {}
@@ -378,6 +416,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchArgs, IpcE
     let mut single_use = false;
     let mut max_connections = None;
     let mut enterprise_path = None;
+    let mut package_dir = None;
+    let mut listen_explicit = false;
+    let mut seal_package = false;
+    let mut check_package = false;
     let mut provision_store = false;
     let mut issue_token = None;
     let mut args = args.into_iter();
@@ -389,6 +431,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchArgs, IpcE
                     "--enterprise-config",
                 )?))
             }
+            "--package" => {
+                package_dir = Some(std::path::PathBuf::from(required(&mut args, "--package")?))
+            }
+            "--seal" => seal_package = true,
+            "--check" => check_package = true,
             "--provision-store" => provision_store = true,
             "--issue-tenant-token" => {
                 let account = required(&mut args, "--issue-tenant-token")?;
@@ -407,7 +454,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchArgs, IpcE
                 }
                 max_connections = Some(count);
             }
-            "--listen" => listen = required(&mut args, "--listen")?,
+            "--listen" => {
+                listen = required(&mut args, "--listen")?;
+                listen_explicit = true;
+            }
             "--allow" => allowlist.push(required(&mut args, "--allow")?),
             "--max-payload" => {
                 max_payload_bytes = required(&mut args, "--max-payload")?
@@ -427,7 +477,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchArgs, IpcE
             "--single-use" => single_use = true,
             "--help" => {
                 println!(
-                    "nexus-daemon --listen PATH --allow ENDPOINT [--allow ENDPOINT] [--max-payload N] [--timeout-ms N] [--idempotency-ttl-ms N] [--single-use] [--max-connections N] [--enterprise-config PATH] [--provision-store] [--issue-tenant-token ACCOUNT ROLE TTL_MS]\nkey is read from stdin; Ctrl-C requests verified cleanup; enterprise mode requires a durable Redis namespace and bound payload requests"
+                    "nexus-daemon --listen PATH --allow ENDPOINT [--allow ENDPOINT] [--max-payload N] [--timeout-ms N] [--idempotency-ttl-ms N] [--single-use] [--max-connections N] [--enterprise-config PATH] [--provision-store] [--issue-tenant-token ACCOUNT ROLE TTL_MS] [--package DIR] [--seal] [--check]\nkey is read from stdin; Ctrl-C requests verified cleanup; enterprise mode requires a durable Redis namespace and bound payload requests; --package validates config.toml, .env, and the pilot policy before the broker starts"
                 );
                 std::process::exit(0);
             }
@@ -445,6 +495,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchArgs, IpcE
         },
         max_connections,
         enterprise_path,
+        package_dir,
+        listen_explicit,
+        seal_package,
+        check_package,
         provision_store,
         issue_token,
     })

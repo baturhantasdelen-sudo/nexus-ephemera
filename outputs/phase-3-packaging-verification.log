@@ -1,0 +1,279 @@
+=== cargo fmt --all -- --check ===  
+  
+=== CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --all-features -- -D warnings ===  
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.96s
+  
+=== RUSTFLAGS=-D warnings cargo test --workspace --release -- --test-threads=1 ===  
+   Compiling nexus-ephemera-ipc-os v0.2.0 (C:\Users\HP\.cursor\projects\nexus-ephemera\crates\ipc_os)
+   Compiling nexus-ephemera v0.2.0 (C:\Users\HP\.cursor\projects\nexus-ephemera)
+    Finished `release` profile [optimized] target(s) in 4m 48s
+     Running unittests src\lib.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\nexus_ephemera-880f87f611af3c6f.exe)
+
+running 83 tests
+test apoptosis::tests::buffer_bytes_survive_page_lock ... ok
+test apoptosis::tests::cleanup_hooks_run_before_buffer_wipe ... ok
+test apoptosis::tests::engaged_rejects_new_buffers ... ok
+test apoptosis::tests::ephemeral_buffer_drop_zeroizes_shared_storage ... ok
+test apoptosis::tests::ephemeral_buffer_with_locked_mut_wipes_on_panic ... ok
+test apoptosis::tests::ephemeral_fill_syncs_shared_storage ... ok
+test apoptosis::tests::lifecycle_rejects_after_engaged_bit ... ok
+test apoptosis::tests::multiple_buffers_cleared_together ... ok
+test apoptosis::tests::nested_permits_do_not_deadlock ... ok
+test apoptosis::tests::panicking_hook_transitions_to_partial_without_infinite_loop ... ok
+test apoptosis::tests::pre_apoptosis_aux_unlock_failure_yields_partial_status ... ok
+test apoptosis::tests::reentrant_hook_calling_trigger_does_not_deadlock ... ok
+test apoptosis::tests::request_apoptosis_delegates_to_trigger ... ok
+test apoptosis::tests::secure_token_drop_unregisters_without_panic ... ok
+test apoptosis::tests::secure_token_registers_and_wipes_on_apoptosis ... ok
+test apoptosis::tests::trigger_apoptosis_is_idempotent ... ok
+test apoptosis::tests::trigger_from_permit_does_not_self_deadlock ... ok
+test apoptosis::tests::trigger_waits_for_inflight_permit ... ok
+test apoptosis::tests::wait_apoptosis_under_permit_returns_would_deadlock ... ok
+test apoptosis::tests::zeroize_traits_cover_public_buffers ... ok
+test audit::tests::retained_chain_is_verifiable_after_eviction ... ok
+test broker::tests::dispatch_does_not_hold_the_wipe_permit ... ok
+test broker::tests::expired_authority_seals_without_dispatch ... ok
+test broker::tests::failed_seal_is_not_classified_as_success ... ok
+test broker::tests::inconclusive_provider_does_not_hide_partial_cleanup ... ok
+test broker::tests::local_only_and_provider_binding_reject_before_transport ... ok
+test broker::tests::partial_seal_is_not_a_successful_receipt ... ok
+test broker::tests::realistic_partial_seal_zeroizes_request_and_returns_cleanup_incomplete ... ok
+test broker::tests::single_use_execute_hides_key_and_wipes ... ok
+test broker::tests::single_use_panic_consumes_authority ... ok
+test broker::tests::split_dispatch_cannot_bypass_single_use_or_provider_policy ... ok
+test context::tests::audit_report_omits_secret_on_complete_and_failed ... ok
+test context::tests::budget_overrun_seals_context_and_wipes ... ok
+test context::tests::empty_seal_reports_no_observed_lock ... ok
+test context::tests::expired_context_seals_instead_of_accepting_more_data ... ok
+test context::tests::isolated_contexts_cannot_read_each_other ... ok
+test context::tests::partial_unlock_quarantines_and_blocks_reopen ... ok
+test context::tests::read_after_apoptosis_is_denied ... ok
+test crypto::tests::global_session_seal_open ... ok
+test crypto::tests::guarded_hmac_matches_rfc4231_known_answer ... ok
+test crypto::tests::hmac_rejects_missing_forged_and_stale_signatures ... ok
+test crypto::tests::nonce_error_wipes_destination ... ok
+test crypto::tests::seal_and_open_in_place_reject_short_nonce ... ok
+test crypto::tests::signature_protocol_matches_independent_python_vector ... ok
+test crypto::tests::wipe_session_clears_slot ... ok
+test enterprise::tests::empty_merkle_root_is_stable ... ok
+test enterprise::tests::mutated_event_breaks_the_chain_and_the_export ... ok
+test enterprise_runtime::tests::https_transport_sends_exact_body_and_preserves_real_failure_status ... ok
+test enterprise_runtime::tests::redis_completion_audit_failure_is_cached_partial_and_closes_admission ... ignored, requires dedicated Redis with AOF always/noeviction
+test enterprise_runtime::tests::redis_fencing_cache_partial_conflict_capacity_and_quarantine ... ignored, requires dedicated Redis with AOF always/noeviction
+test enterprise_runtime::tests::redis_multiprocess_claim_and_crash_remain_inconclusive ... ignored, requires dedicated Redis with AOF always/noeviction
+test enterprise_runtime::tests::restart_seed_committed_receipt ... ignored, CI restart protocol: seed before actual Redis restart
+test enterprise_runtime::tests::restart_verify_committed_receipt ... ignored, CI restart protocol: verify after actual Redis restart
+test enterprise_runtime::tests::server_role_payload_and_closed_authority_are_enforced ... ok
+test exposure::tests::no_plaintext_export_does_not_render_secret ... ok
+test exposure::tests::sanitize_denial_returns_before_copying_the_line ... ok
+test exposure::tests::sanitizer_ignores_needle_inside_multibyte_char ... ok
+test exposure::tests::sanitizer_masks_registered_secret ... ok
+test idempotency::tests::cleanup_incomplete_replays_without_leaking_the_digest ... ok
+test idempotency::tests::expired_key_is_not_a_replay_and_a_full_cache_refuses_a_new_key ... ok
+test idempotency::tests::pending_and_inconclusive_reject_a_second_dispatch ... ok
+test idempotency::tests::replay_does_not_require_a_second_dispatch_and_conflict_does_not_match ... ok
+test idempotency::tests::uncertain_side_effect_never_expires_or_allows_key_rebinding ... ok
+test ipc::nine_point_audit::timeout_then_late_completion_does_not_repeat_the_same_key ... ok
+test ipc::tests::cleanup_incomplete_is_not_a_receipt ... ok
+test ipc::tests::off_allowlist_targets_are_denied_before_dispatch ... ok
+test ipc::tests::peer_policy_rejects_missing_and_foreign_callers ... ok
+test ipc::tests::unknown_or_failed_seal_is_not_a_receipt ... ok
+test ipc::tests::unsafe_targets_cannot_be_enabled_by_configuration ... ok
+test mesh::tests::ingest_and_open_scout_handoff ... ok
+test mesh::tests::ingest_denied_after_apoptosis ... ok
+test mesh::tests::mesh_envelope_carries_local_file_meta ... ok
+test mesh::tests::publish_receive_roundtrip ... ok
+test mesh::tests::run_event_loop_drains_queue ... ok
+test mesh::tests::wipe_on_apoptosis_clears_queue ... ok
+test metrics::tests::rate_and_p95_use_only_recorded_numbers ... ok
+test metrics::tests::snapshot_text_is_only_counter_names_and_integers ... ok
+test packaging::tests::policy_hmac_matches_the_independent_vector ... ok
+test scout::tests::discovery_cycle_seals_and_stores_in_vault ... ok
+test scout::tests::env_denylist_covers_common_patterns ... ok
+test scout::tests::env_metadata_skips_sensitive_keys ... ok
+test scout::tests::scan_environment_fails_closed_after_apoptosis ... ok
+test scout::tests::scan_environment_produces_snapshot ... ok
+
+test result: ok. 78 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+     Running unittests src\daemon_main.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\nexus_daemon-f955664f06984a38.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\nexus_ephemera-20639be9cb1aacb3.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\broker_transaction.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\broker_transaction-d40a474b05800357.exe)
+
+running 1 test
+test agent_cannot_read_key_and_executes_only_through_broker ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\chaos_resilience.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\chaos_resilience-fd6e6c59a13ac68a.exe)
+
+running 1 test
+test chaos_resilience_keeps_one_dispatch_and_a_verifiable_log ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\ecosystem_mcp_receipt.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\ecosystem_mcp_receipt-1bdf58cc86466c54.exe)
+
+running 1 test
+test mcp_tool_call_receipt_is_retained_and_replay_does_not_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\enterprise_hardening.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\enterprise_hardening-f8b49af1415afee2.exe)
+
+running 7 tests
+test audit_budget_is_bounded_and_rejects_before_growth ... ok
+test audit_rejects_extension_duplicate_truncation_and_fully_rehashed_rewrite ... ok
+test file_checkpoint_requires_monotonic_sequence_and_a_fresh_stream ... ok
+test owned_worker_gate_survives_unwind_and_stays_bounded ... ok
+test remote_plaintext_or_insecure_redis_is_not_an_enterprise_backend ... ok
+test role_policy_expiry_and_same_length_mac_tampering_fail_closed ... ok
+test tenant_key_close_is_terminal_and_credentials_debug_is_redacted ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\enterprise_live.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\enterprise_live-67616d0355eb2206.exe)
+
+running 1 test
+test enterprise_two_daemons_forward_once_and_enforce_raw_ipc_policy ... ignored, requires dedicated AOF Redis; mandatory enterprise CI gate
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\enterprise_tls_startup.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\enterprise_tls_startup-083ea4bbb0d68b84.exe)
+
+running 1 test
+test standalone_transport_installs_tls_provider_without_a_test_server ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\forensic_residue.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\forensic_residue-752828d7bbb4bda7.exe)
+
+running 1 test
+test end_to_end_canary_leaves_no_plaintext_after_apoptosis ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\installation_smoke.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\installation_smoke-fcbcfd8f7cca1417.exe)
+
+running 2 tests
+test clean_install_serves_health_and_opens_one_issue ... ok
+test missing_package_field_fails_before_start ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests\ipc_isolation.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\ipc_isolation-2e98b7d0a448e94b.exe)
+
+running 7 tests
+test cancelled_accept_and_frame_read_preserve_listener ... ok
+test daemon_binds_inside_the_runtime_and_prints_ready ... ok
+test daemon_stdin_timeout_joins_before_ready ... ok
+test duplicate_idempotency_key_does_not_dispatch_again ... ok
+test peer_policy_and_cleanup_stay_closed ... ok
+test stalled_and_oversized_frames_are_rejected_before_use ... ok
+test subprocess_allowlist_checks_the_parent_pid ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.48s
+
+     Running tests\pilot_daemon_smoke.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\pilot_daemon_smoke-335f085bac5e285f.exe)
+
+running 3 tests
+test interrupted_provider_cannot_report_successful_shutdown ... ok
+test release_daemon_binds_a_private_endpoint_and_denies_foreign_targets ... ok
+test signed_loopback_checks_body_route_and_replays_without_a_second_dispatch ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.41s
+
+     Running tests\pilot_github_issue.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\pilot_github_issue-b9ac9826fa5f7d8f.exe)
+
+running 1 test
+test support_agent_opens_one_issue_and_reconciles_without_a_second_create ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\pipeline_integration.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\pipeline_integration-235dcd4bbe2e9d57.exe)
+
+running 1 test
+test full_offline_pipeline ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\reference_flow.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\reference_flow-1904e8220d562f0f.exe)
+
+running 2 tests
+test reference_flow_mock_and_realistic_never_export_the_key ... ok
+test transport_panic_seals_single_use_and_stays_visible ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\reference_verifier.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\reference_verifier-2209bf65153ef064.exe)
+
+running 2 tests
+test signed_execute_is_verified_once_and_replay_does_not_dispatch ... ok
+test verifier_rejects_missing_forged_stale_and_duplicate_requests ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running unittests src\lib.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\nexus_ephemera_ipc_os-a09e8b768e1d93ec.exe)
+
+running 3 tests
+test windows::tests::default_pipe_connectivity_control ... ok
+test windows::tests::pipe_dacl_is_the_current_user_only ... ok
+test windows::tests::unexpected_dacl_trustee_is_rejected ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\nexus_ephemera_memlock-1a5025b41bdb4cf9.exe)
+
+running 11 tests
+test tests::allocate_then_write ... ok
+test tests::dirty_lock_rollback_quarantines_allocation ... ok
+test tests::dynamic_page_size_nonzero ... ok
+test tests::locked_buffer_replace ... ok
+test tests::locked_buffer_roundtrip ... ok
+test tests::partial_unlock_failure_quarantines_buffer_and_blocks_writes ... ok
+test tests::physical_canary_scrub_leaves_zero_residue_across_lock_span ... ok
+test tests::process_memory_hardening_succeeds ... ok
+test tests::try_replace_partial_unlock_failure_quarantines_old_buffer ... ok
+test tests::try_set_len_clears_lock_span_slack ... ok
+test tests::wipe_prevents_further_writes ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running probe\linux_fork_probe.rs (C:\Users\HP\AppData\Local\Temp\cursor-sandbox-cache\b091335c7f5cf348ce671be4d7dd15a6\cargo-target\release\deps\linux_fork_probe-958db6e65d37272d.exe)
+   Doc-tests nexus_ephemera
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nexus_ephemera_ipc_os
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nexus_ephemera_memlock
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+  
+=== pytest ===  
+.....................s..........................s.....                   [100%]
+52 passed, 2 skipped in 1.73s
+  
+=== mypy --strict ===  
+Success: no issues found in 14 source files
+  
+=== gates complete === 

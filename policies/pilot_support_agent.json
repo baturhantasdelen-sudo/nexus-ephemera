@@ -1,0 +1,11 @@
+{
+  "role": "support_agent",
+  "service_account_id": "support",
+  "provider": "github_issues",
+  "method": "POST",
+  "owner": "pilot-org",
+  "repo": "support-queue",
+  "endpoint": "https://api.github.com/repos/pilot-org/support-queue/issues",
+  "allowed_fields": ["body", "title"],
+  "denied_capabilities": ["delete", "infrastructure", "transfer"]
+}
