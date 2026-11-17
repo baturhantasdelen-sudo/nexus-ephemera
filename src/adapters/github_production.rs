@@ -11,6 +11,10 @@ use crate::ipc::IpcError;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+/// Bounded opaque provider credentials, including long installation tokens.
+/// Keep file admission and transport admission on the same limit.
+pub const GITHUB_TOKEN_MAX_BYTES: usize = 4096;
+
 pub struct GithubTransport {
     http: HttpPayloadTransport,
     policy: GithubIssuePolicy,
@@ -29,7 +33,7 @@ impl GithubTransport {
         let result = (|| {
             nexus_ephemera_memlock::harden_process_memory().map_err(|_| IpcError::TargetDenied)?;
             if token.is_empty()
-                || token.len() > 256
+                || token.len() > GITHUB_TOKEN_MAX_BYTES
                 || !token.iter().all(u8::is_ascii_graphic)
                 || token.windows(7).any(|part| part == b"Bearer ")
             {
@@ -164,6 +168,45 @@ mod tests {
     use super::*;
     use std::{sync::Arc, time::Duration};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn opaque_provider_tokens_are_bounded_and_inputs_are_wiped() {
+        let _guard = crate::apoptosis::test_serial();
+        crate::apoptosis::reset_coordinator_for_tests();
+        for length in [1, 256, 1024, GITHUB_TOKEN_MAX_BYTES] {
+            let policy =
+                GithubIssuePolicy::load(include_bytes!("../../policies/pilot_support_agent.json"))
+                    .unwrap();
+            let http = HttpPayloadTransport::new(Duration::from_secs(2)).unwrap();
+            let mut input = vec![b'x'; length];
+            let transport = GithubTransport::new(http, policy, &mut input).unwrap();
+            assert!(input.iter().all(|byte| *byte == 0));
+            assert_eq!(
+                transport
+                    .token
+                    .with_sensitive_bytes(|bytes| Ok(bytes.len()))
+                    .unwrap(),
+                length
+            );
+        }
+        for mut input in [
+            Vec::new(),
+            vec![b'x'; GITHUB_TOKEN_MAX_BYTES + 1],
+            b"fixture\r\ninjected".to_vec(),
+            vec![0xff],
+            b"Bearer fixture".to_vec(),
+        ] {
+            let policy =
+                GithubIssuePolicy::load(include_bytes!("../../policies/pilot_support_agent.json"))
+                    .unwrap();
+            let http = HttpPayloadTransport::new(Duration::from_secs(2)).unwrap();
+            assert!(matches!(
+                GithubTransport::new(http, policy, &mut input),
+                Err(IpcError::Malformed)
+            ));
+            assert!(input.iter().all(|byte| *byte == 0));
+        }
+    }
 
     #[test]
     fn verified_tls_native_provider_acceptance_and_lost_ack_are_not_retried() {

@@ -204,8 +204,10 @@ fn run() -> Result<(), IpcError> {
                 let policy = nexus_ephemera::adapters::github::GithubIssuePolicy::load(
                     &nexus_ephemera_ipc_os::read_private_file(policy_path, 65536)?,
                 )?;
-                let mut token =
-                    Zeroizing::new(nexus_ephemera_ipc_os::read_private_file(token_path, 256)?);
+                let mut token = Zeroizing::new(nexus_ephemera_ipc_os::read_private_file(
+                    token_path,
+                    nexus_ephemera::adapters::github_production::GITHUB_TOKEN_MAX_BYTES,
+                )?);
                 DaemonTransport::Github(
                     nexus_ephemera::adapters::github_production::GithubTransport::new(
                         http, policy, &mut token,

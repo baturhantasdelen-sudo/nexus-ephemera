@@ -3,7 +3,7 @@ resolver = "2"
 members = [".", "crates/memlock", "crates/ipc_os"]
 
 [workspace.package]
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.2"
 edition = "2024"
 license = "MIT"
 authors = ["Baturhan TaÅŸdelen <baturhantasdelen@gmail.com>"]
@@ -18,8 +18,8 @@ keywords = [
 categories = ["cryptography", "memory-management", "os"]
 
 [workspace.dependencies]
-nexus-ephemera-memlock = { version = "0.3.0-rc.1", path = "crates/memlock" }
-nexus-ephemera-ipc-os = { version = "0.3.0-rc.1", path = "crates/ipc_os" }
+nexus-ephemera-memlock = { version = "0.3.0-rc.2", path = "crates/memlock" }
+nexus-ephemera-ipc-os = { version = "0.3.0-rc.2", path = "crates/ipc_os" }
 
 [package]
 rust-version = "1.95"
